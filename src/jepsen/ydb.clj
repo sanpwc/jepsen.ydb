@@ -37,9 +37,19 @@
               (merge result {:valid? false})
               result)))))))
 
+(defn validate-opts
+  "Validates that options are compatible with each other"
+  [opts]
+  (when (and (= (:model opts) :snapshot-isolation)
+             (:with-opindex opts))
+    (throw (IllegalArgumentException.
+            "--with-opindex is not compatible with --model snapshot-isolation")))
+  opts)
+
 (defn ydb-test
   "Tests YDB"
   [opts]
+  (validate-opts opts)	
   (let [workload (ydb-workload opts)
         db       db/noop
         os       os/noop
