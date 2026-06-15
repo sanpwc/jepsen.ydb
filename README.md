@@ -15,15 +15,20 @@ A command line utility for testing YDB with Jepsen.
 export JAVA_CMD=$HOME/jdk-21.0.8+9/bin/java
 ```
 4. Download [lein](https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein) to `/usr/local/bin/`
-5. Create a `~/ydb-nodes.txt` file that lists your YDB cluster nodes.
-
+5. Create the file `~/ydb-nodes.txt` containing a list of YDB cluster nodes that will be excluded from the nemesis process (i.e., will not be targeted for termination).
 6. To test column shard tables, you need to enable data query in YDB config by setting:
 ```yaml
 table_service_config:
     allow_olap_data_query: true
 ```
+7. Runing jepsen tests
 
-7. Example command for running the test:
+Please pay attention that some parameters are incompatible.
+
+- `--with-opindex` cannot be used with `--model snapshot-isolation`
+
+
+ Example command for running the test:
 ```bash
 lein run test \
     --nodes-file ~/ydb-nodes.txt \
