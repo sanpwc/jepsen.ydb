@@ -41,9 +41,10 @@
   "Validates that options are compatible with each other"
   [opts]
   (when (and (:with-opindex opts)
-           (not= (:model opts) :ydb-serializable))
-  (throw (IllegalArgumentException.
-          "--with-opindex can be used with --model ydb-serializable only")))
+             (:model opts)
+             (not= (:model opts) :ydb-serializable))
+    (throw (IllegalArgumentException.
+            "--with-opindex can be used with --model ydb-serializable only")))
   opts)
 
 (defn ydb-test
