@@ -40,10 +40,11 @@
 (defn validate-opts
   "Validates that options are compatible with each other"
   [opts]
-  (when (and (= (:model opts) :snapshot-isolation)
-             (:with-opindex opts))
+  (when (and (:with-opindex opts)
+             (:model opts)
+             (not= (:model opts) :ydb-serializable))
     (throw (IllegalArgumentException.
-            "--with-opindex is not compatible with --model snapshot-isolation")))
+            "--with-opindex can be used with --model ydb-serializable only")))
   opts)
 
 (defn ydb-test

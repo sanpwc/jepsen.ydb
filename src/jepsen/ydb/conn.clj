@@ -85,7 +85,8 @@
   [model]
   (case model
     :ydb-serializable TxMode/SERIALIZABLE_RW
-    :snapshot-isolation TxMode/SNAPSHOT_RW))
+    :snapshot-isolation TxMode/SNAPSHOT_RW
+    :read-committed TxMode/READ_COMMITTED_RW))
 
 (deftype Transaction [session mode
                       ^:unsynchronized-mutable tx
