@@ -25,7 +25,7 @@ table_service_config:
 
 Please pay attention that some parameters are incompatible.
 
-- `--with-opindex` cannot be used with `--model snapshot-isolation`
+- The `--with-opindex` option is only compatible with `--model ydb-serializable`.
 
 
  Example command for running the test:

@@ -24,6 +24,19 @@
                 (ydb/validate-opts {:model :snapshot-isolation
                                     :with-opindex true}))))
 
+  (testing "Valid: read-committed without opindex"
+    (is (= {:model :read-committed :with-opindex false}
+           (ydb/validate-opts {:model :read-committed :with-opindex false}))))
+
+  (testing "Valid: read-committed without opindex key"
+    (is (= {:model :read-committed}
+           (ydb/validate-opts {:model :read-committed}))))
+
+  (testing "Invalid: read-committed with opindex"
+    (is (thrown? IllegalArgumentException
+                (ydb/validate-opts {:model :read-committed
+                                    :with-opindex true}))))
+
   (testing "Valid: empty opts"
     (is (= {} (ydb/validate-opts {}))))
 
