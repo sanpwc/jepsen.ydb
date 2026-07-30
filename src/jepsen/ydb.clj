@@ -21,12 +21,8 @@
             [jepsen.ydb.append :as append]
             [jepsen.ydb.append-with-deletes :as append-with-deletes]))
 
-;;; ─── Constants ───────────────────────────────────────────────────────────────
-
 (def dynamic-service "kikimr-multi@31003.service")
 (def storage-service "kikimr.service")
-
-;;; ─── Dual-stack network (IPv4 + IPv6) ───────────────────────────────────────
 
 (defn ipv6?
   "Returns true when ip-str is an IPv6 address (contains a colon)."
@@ -45,10 +41,6 @@
                 cmd (if (ipv6? ip) :ip6tables :iptables)]
             (c/su (c/exec cmd :-A :INPUT :-s ip :-j :DROP :-w))))))
 
-    ;; FIX #1: wrap each exec in try/catch.
-    ;; A non-zero exit (ip6tables not installed, chains already empty) causes
-    ;; jepsen's SSH retry layer to return a PersistentHashMap instead of
-    ;; throwing, which blows up with ClassCastException in retry.clj.
     (heal! [net test]
       (c/with-test-nodes test
         (c/su
@@ -106,8 +98,6 @@
               (when (seq ipv6s)
                 (c/exec :ip6tables :-A :INPUT :-s (str/join "," ipv6s) :-j :DROP :-w)))))))))
 
-;;; ─── Systemd helpers ─────────────────────────────────────────────────────────
-
 (defn sigkill-and-wait!
   "Sends SIGKILL to a systemd unit and blocks until it is inactive."
   [unit]
@@ -124,9 +114,6 @@
     (catch Exception e
       (warn "Failed to start" unit ":" (.getMessage e)))))
 
-;; FIX #2: safe-pause! mirrors safe-resume!.
-;; systemctl kill -s SIGSTOP exits non-zero when the unit is already dead,
-;; triggering the same PersistentHashMap ClassCastException in retry.clj.
 (defn safe-pause!
   "Sends SIGSTOP to a systemd unit; logs a warning if the unit is not found."
   [unit]
@@ -143,9 +130,6 @@
     (catch Exception e
       (warn "Failed to resume" unit ":" (.getMessage e)))))
 
-;; FIX #3: safe-restart! for --nemesis all.
-;; When pause + restart faults run concurrently, systemctl restart on a
-;; SIGSTOP'd unit can time out and return non-zero.
 (defn safe-restart!
   "Restarts a systemd unit; logs a warning instead of crashing if it fails."
   [unit]
@@ -153,8 +137,6 @@
     (c/exec :systemctl :restart unit)
     (catch Exception e
       (warn "Failed to restart" unit ":" (.getMessage e)))))
-
-;;; ─── Database (with Pause support for nc/pause-package) ─────────────────────
 
 (defn make-db []
   (reify db/DB
@@ -164,7 +146,6 @@
       (info "YDB testing finished on node:" node))
 
     db/Pause
-    ;; FIX #2 applied: use safe-pause! so a dead unit does not crash the nemesis.
     (pause! [_ _test node]
       (info "SIGSTOP dynamic+storage on" node)
       (c/su
@@ -178,8 +159,6 @@
         (safe-resume! dynamic-service)
         (safe-resume! storage-service))
       :resumed)))
-
-;;; ─── Custom service nemesis (kill-dynamic/storage, restart-dynamic/storage) ──
 
 (def service-faults
   "All faults handled by the service nemesis."
@@ -232,9 +211,6 @@
 
     (teardown! [_this _test])
 
-    ;; FIX #4: implement nemesis/Reflection so nc/compose-packages can inspect
-    ;; which :f values this nemesis handles. Without this, compose-packages
-    ;; throws IllegalArgumentException: No implementation of method :fs.
     nemesis/Reflection
     (fs [_this] service-nemesis-fs)))
 
@@ -284,9 +260,6 @@
            {:name "restart-dynamic" :fs #{:restart-dynamic} :color "#F39C12"}
            {:name "restart-storage" :fs #{:restart-storage} :color "#E67E22"}}}))))
 
-
-;;; ─── Workload helpers ────────────────────────────────────────────────────────
-
 (defn ydb-workload [opts]
   (case (:workload-name opts)
     "append"              (append/workload opts)
@@ -313,14 +286,11 @@
             "--with-opindex can be used with --model ydb-serializable only")))
   opts)
 
-;;; ─── Test builder ────────────────────────────────────────────────────────────
-
 (defn ydb-test [opts]
   (validate-opts opts)
   (let [workload (ydb-workload opts)
         the-db   (make-db)
 
-        ;; Standard packages for partition, clock, pause.
         nc-faults (filter #{:partition :clock :pause} (:nemesis opts))
         nc-pkgs   (nc/nemesis-packages
                     {:db       the-db
@@ -330,7 +300,6 @@
                      :pause     {:targets [:one]}
                      :interval (:nemesis-interval opts)})
 
-        ;; Custom service package for kill/restart faults.
         svc-pkg   (service-package
                     {:faults   (:nemesis opts)
                      :interval (:nemesis-interval opts)
@@ -341,9 +310,6 @@
                       (filter (fn [p] (some? (:generator p))) nc-pkgs)
                       [svc-pkg]))
 
-        ;; FIX #5: when no faults are selected (--nemesis absent or none),
-        ;; all-pkgs is empty. compose-packages on empty seq crashes.
-        ;; Fall back to a trivial noop structure.
         nemesis   (if (seq all-pkgs)
                     (nc/compose-packages all-pkgs)
                     {:nemesis         nemesis/noop
@@ -370,11 +336,7 @@
                                    :stats      (checker/stats)
                                    :exceptions (ydb-unhandled-exceptions opts)
                                    :workload   (:checker workload)})
-            ;; FIX #5 cont.: gen/nemesis MUST always wrap the client generator
-            ;; even when nem-gen is nil. Without gen/nemesis the nemesis worker
-            ;; process receives client ops (:f :txn, :type :invoke) and crashes
-            ;; with "type should be :info". gen/nemesis nil means "no nemesis
-            ;; ops" but still correctly routes client ops to client workers only.
+
             :generator
             (gen/phases
               (->> (:generator workload)
@@ -384,8 +346,6 @@
               (gen/log "Recovering cluster state after test...")
               (when final-gen
                 (gen/nemesis final-gen)))})))
-
-;;; ─── CLI ─────────────────────────────────────────────────────────────────────
 
 (def all-nemesis-faults
   "Full set of accepted nemesis fault keywords."
@@ -472,4 +432,5 @@
                    (cli/serve-cmd)
                    (clean-valid-cmd))
             args))
+
 
