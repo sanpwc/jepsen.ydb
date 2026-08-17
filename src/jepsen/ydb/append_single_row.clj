@@ -6,12 +6,9 @@
             [jepsen.ydb.conn :as conn]
             [jepsen.ydb.debug-info :as debug-info]
             [jepsen.ydb.serializable :as ydb-serializable])
-  (:import (java.util ArrayList)
-           (com.google.protobuf ByteString)
-           (tech.ydb.core StatusCode)
+  (:import (com.google.protobuf ByteString)
            (tech.ydb.table.query Params)
-           (tech.ydb.table.values PrimitiveValue)
-           (tech.ydb.table.values Value)))
+           (tech.ydb.table.values PrimitiveValue)))
 
 (def ^:dynamic *ballast* (ByteString/copyFromUtf8 ""))
 
@@ -81,17 +78,6 @@
                         (:store-type test))]
       (conn/execute-scheme! session query))))
 
-(defn execute-key-exists
-  "Returns true if the given key exists in the table."
-  [test tx k]
-  (let [query (format "DECLARE $key AS Int64;
-                       SELECT key FROM `%s` WHERE key = $key;"
-                      (:db-table test))
-        params (Params/of "$key" (PrimitiveValue/newInt64 k))
-        result (conn/execute! tx query params)
-        rs (.getResultSet result 0)]
-    (.next rs)))
-
 (defn execute-list-read
   "Reads the list for key k. Returns nil if absent, or a vector of longs."
   [test tx k]
@@ -103,33 +89,33 @@
         rs (.getResultSet result 0)]
     (if (.next rs)
       (let [val-str (String. (-> rs (.getColumn 0) .getBytes))]
-        (if (or (nil? val-str) (str/blank? val-str))
+        (if (str/blank? val-str)
           []
           (mapv #(Long/parseLong %) (str/split val-str #","))))
       nil)))
 
-(defn execute-list-insert
-  "Inserts a new row for key k with val as the first element."
-  [test tx k v]
-  (let [query (format "DECLARE $key AS Int64;
-                       DECLARE $value AS Int64;
-                       DECLARE $ballast AS Bytes;
-                       INSERT INTO `%s` (key, val, ballast) VALUES ($key, CAST($value AS String), $ballast);"
-                      (:db-table test))
-        params (Params/of "$key"     (PrimitiveValue/newInt64 k)
-                          "$value"   (PrimitiveValue/newInt64 v)
-                          "$ballast" (PrimitiveValue/newBytes *ballast*))]
-    (conn/execute! tx query params)))
+(defn execute-list-append
+  "Appends v to the list for key k using a single UPDATE+INSERT query.
+   UPDATE handles the existing-key case (server-side concatenation);
+   INSERT handles the new-key case via a conditional SELECT.
 
-(defn execute-list-update
-  "Appends v to the existing list for key k via server-side concatenation."
+   YDB doesn't have savepoints or INSERT ... ON CONFLICT DO UPDATE yet, so
+   some probability of failure due to concurrent inserts is expected."
   [test tx k v]
   (let [query (format "DECLARE $key AS Int64;
                        DECLARE $value AS Int64;
                        DECLARE $ballast AS Bytes;
-                       UPDATE `%s` SET val = val || ',' || CAST($value AS String), ballast = $ballast
-                         WHERE key = $key;"
-                      (:db-table test))
+
+                       $value_str = CAST($value AS String);
+
+                       UPDATE `%s` SET val = val || ',' || $value_str, ballast = $ballast
+                         WHERE key = $key;
+
+                       INSERT INTO `%s` (key, val, ballast)
+                         SELECT key, val, ballast
+                         FROM AS_TABLE(AsList(AsStruct($key AS key, $value_str AS val, $ballast AS ballast)))
+                         WHERE NOT EXISTS (SELECT val FROM `%s` WHERE key = $key);"
+                      (:db-table test) (:db-table test) (:db-table test))
         params (Params/of "$key"     (PrimitiveValue/newInt64 k)
                           "$value"   (PrimitiveValue/newInt64 v)
                           "$ballast" (PrimitiveValue/newBytes *ballast*))]
@@ -171,11 +157,7 @@
   [test tx [f k v :as mop]]
   (case f
     :r [[f k (execute-list-read test tx k)]]
-    :append [(let [exists? (execute-key-exists test tx k)]
-               (if exists?
-                 (execute-list-update test tx k v)
-                 (execute-list-insert test tx k v))
-               mop)]
+    :append [(do (execute-list-append test tx k v) mop)]
     :commit (do
               (conn/auto-commit! tx)
               (apply-mop! test tx v))))
