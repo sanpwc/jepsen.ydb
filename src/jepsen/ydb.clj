@@ -19,7 +19,8 @@
             [jepsen.control.util :as cu]
             [jepsen.ydb.cli.clean :refer [clean-valid-cmd]]
             [jepsen.ydb.append :as append]
-            [jepsen.ydb.append-with-deletes :as append-with-deletes]))
+            [jepsen.ydb.append-with-deletes :as append-with-deletes]
+            [jepsen.ydb.append-single-row :as append-single-row]))
 
 (def dynamic-service "kikimr-multi@31003.service")
 (def storage-service "kikimr.service")
@@ -263,7 +264,8 @@
 (defn ydb-workload [opts]
   (case (:workload-name opts)
     "append"              (append/workload opts)
-    "append-with-deletes" (append-with-deletes/workload opts)))
+    "append-with-deletes" (append-with-deletes/workload opts)
+    "append-single-row"   (append-single-row/workload opts)))
 
 (defn ydb-unhandled-exceptions [opts]
   (let [wrapped (checker/unhandled-exceptions)]
