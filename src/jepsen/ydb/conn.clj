@@ -200,6 +200,7 @@
            (= status-code# StatusCode/BAD_SESSION) (assoc ~op :type :fail, :error [:bad-session (.toString status#)])
            (= status-code# StatusCode/SESSION_BUSY) (assoc ~op :type :fail, :error [:session-busy (.toString status#)])
            (= status-code# StatusCode/CLIENT_RESOURCE_EXHAUSTED) (assoc ~op :type :fail, :error [:client-resource-exhausted (.toString status#)])
+           (= status-code# StatusCode/PRECONDITION_FAILED) (assoc ~op :type :fail, :error [:precondition-failed (.toString status#)])
            ; Known status codes where operation may have actually committed
            (= status-code# StatusCode/UNDETERMINED) (assoc ~op :type :info, :error [:undetermined (.toString status#)])
            ; For other exceptions we assume we don't know whether it committed or not
