@@ -46,7 +46,7 @@
       (c/with-test-nodes test
         (c/su
           (try
-            (c/exec :iptables  :-F :-w)
+            (c/exec :iptables :-F :-w)
             (catch Exception e
               (warn "iptables -F -w failed during heal!:" (.getMessage e))))
           (try
@@ -95,7 +95,7 @@
                 ipv6s (filter ipv6? ips)]
             (c/su
               (when (seq ipv4s)
-                (c/exec :iptables  :-A :INPUT :-s (str/join "," ipv4s) :-j :DROP :-w))
+                (c/exec :iptables :-A :INPUT :-s (str/join "," ipv4s) :-j :DROP :-w))
               (when (seq ipv6s)
                 (c/exec :ip6tables :-A :INPUT :-s (str/join "," ipv6s) :-j :DROP :-w)))))))))
 
@@ -165,8 +165,8 @@
   "All faults handled by the service nemesis."
   #{:kill-dynamic :kill-storage :restart-dynamic :restart-storage})
 
-;; All :f values this nemesis can receive, including recovery ops.
 (def service-nemesis-fs
+  "All operations handled by the service nemesis, including recovery operations."
   #{:kill-dynamic :kill-storage
     :restart-dynamic :restart-storage
     :start-dynamic :start-storage})
@@ -192,7 +192,6 @@
                 (do (info "SIGKILL storage on" node)
                     (sigkill-and-wait! storage-service))
 
-                ;; FIX #3 applied: safe-restart! so a SIGSTOP'd unit doesn't crash.
                 :restart-dynamic
                 (do (info "Restarting dynamic on" node)
                     (safe-restart! dynamic-service))
@@ -215,51 +214,88 @@
     nemesis/Reflection
     (fs [_this] service-nemesis-fs)))
 
-(defn- kill-cycle-gen
-  "Infinite lazy sequence: kill-op → sleep → start-op → repeat."
-  [kill-f start-f interval]
-  (lazy-cat
-    [{:type :info :f kill-f}
-     (gen/sleep interval)
-     {:type :info :f start-f}]
-    (kill-cycle-gen kill-f start-f interval)))
-
-(defn- restart-cycle-gen
-  "Infinite lazy sequence: restart-op → sleep → repeat."
-  [restart-f interval]
-  (lazy-cat
-    [{:type :info :f restart-f}
-     (gen/sleep interval)]
-    (restart-cycle-gen restart-f interval)))
-
 (defn service-package
+  "Builds the service nemesis package. Its generator is used only while composing
+  the package router; ydb-test replaces the composed generator with the strict
+  global generator below."
   [{:keys [faults interval nodes] :or {interval 5}}]
   (let [active (filter service-faults faults)]
     (when (seq active)
-      (let [per-fault-gens
-            (for [f active]
-              (case f
-                :kill-dynamic    (kill-cycle-gen    :kill-dynamic    :start-dynamic    interval)
-                :kill-storage    (kill-cycle-gen    :kill-storage    :start-storage    interval)
-                :restart-dynamic (restart-cycle-gen :restart-dynamic interval)
-                :restart-storage (restart-cycle-gen :restart-storage interval)))
+      {:nemesis  (service-nemesis)
+       :generator
+       (gen/mix
+         (for [fault active]
+           (repeat {:type :info :f fault})))
+       :final-generator
+       (gen/phases
+         {:type :info :f :start-dynamic :value nodes}
+         {:type :info :f :start-storage :value nodes})
+       :perf
+       #{{:name "kill-dynamic"    :fs #{:kill-dynamic}    :color "#E74C3C"}
+         {:name "start-dynamic"   :fs #{:start-dynamic}   :color "#2ECC71"}
+         {:name "kill-storage"    :fs #{:kill-storage}    :color "#C0392B"}
+         {:name "start-storage"   :fs #{:start-storage}   :color "#27AE60"}
+         {:name "restart-dynamic" :fs #{:restart-dynamic} :color "#F39C12"}
+         {:name "restart-storage" :fs #{:restart-storage} :color "#E67E22"}}})))
 
-            combined-gen (gen/mix per-fault-gens)]
+(defn- fault-operations
+  "Returns [attack recovery] for one logical fault. Recovery is nil for restart
+  faults because systemctl restart is a complete, instantaneous disruption.
+  Service recovery targets the same node selected for the attack."
+  [fault nodes]
+  (case fault
+    :partition
+    [{:type :info :f :start-partition :value :one}
+     {:type :info :f :stop-partition}]
 
-        {:nemesis  (service-nemesis)
-         :generator combined-gen
-         ;; After gen/time-limit fires, ensure all services are up on all nodes.
-         :final-generator
-         (gen/phases
-           {:type :info :f :start-dynamic :value nodes}
-           {:type :info :f :start-storage :value nodes})
-         :perf
-         #{{:name "kill-dynamic"    :fs #{:kill-dynamic}    :color "#E74C3C"}
-           {:name "start-dynamic"   :fs #{:start-dynamic}   :color "#2ECC71"}
-           {:name "kill-storage"    :fs #{:kill-storage}    :color "#C0392B"}
-           {:name "start-storage"   :fs #{:start-storage}   :color "#27AE60"}
-           {:name "restart-dynamic" :fs #{:restart-dynamic} :color "#F39C12"}
-           {:name "restart-storage" :fs #{:restart-storage} :color "#E67E22"}}}))))
+    :clock
+    [{:type :info :f :bump-clock}
+     {:type :info :f :reset-clock}]
+
+    :pause
+    [{:type :info :f :pause :value :one}
+     {:type :info :f :resume}]
+
+    :kill-dynamic
+    (let [target [(rand-nth nodes)]]
+      [{:type :info :f :kill-dynamic :value target}
+       {:type :info :f :start-dynamic :value target}])
+
+    :kill-storage
+    (let [target [(rand-nth nodes)]]
+      [{:type :info :f :kill-storage :value target}
+       {:type :info :f :start-storage :value target}])
+
+    :restart-dynamic
+    (let [target [(rand-nth nodes)]]
+      [{:type :info :f :restart-dynamic :value target}
+       nil])
+
+    :restart-storage
+    (let [target [(rand-nth nodes)]]
+      [{:type :info :f :restart-storage :value target}
+       nil])))
+
+(defn- strict-nemesis-cycle
+  "Infinite global sequence:
+
+  random attack -> attack-duration -> matching recovery -> rest-duration.
+
+  Only one attack can be active at a time. A new random fault is selected only
+  after the previous fault has been recovered and the rest period has elapsed."
+  [faults nodes attack-duration rest-duration]
+  (lazy-seq
+    (let [fault             (rand-nth (vec faults))
+          [attack recovery] (fault-operations fault nodes)
+          cycle             (cond-> [attack
+                                     (gen/sleep attack-duration)]
+                              recovery (conj recovery)
+                              true     (conj (gen/sleep rest-duration)))]
+      (concat cycle
+              (strict-nemesis-cycle faults
+                                    nodes
+                                    attack-duration
+                                    rest-duration)))))
 
 (defn ydb-workload [opts]
   (case (:workload-name opts)
@@ -279,48 +315,58 @@
               result)))))))
 
 (defn validate-opts
-  "Validates that options are compatible with each other"
+  "Validates that options are compatible with each other."
   [opts]
   (when (and (:with-opindex opts)
              (:model opts)
              (not= (:model opts) :ydb-serializable))
     (throw (IllegalArgumentException.
-            "--with-opindex can be used with --model ydb-serializable only")))
+             "--with-opindex can be used with --model ydb-serializable only")))
   opts)
 
 (defn ydb-test [opts]
   (validate-opts opts)
-  (let [workload (ydb-workload opts)
-        the-db   (make-db)
+  (let [workload        (ydb-workload opts)
+        the-db          (make-db)
+        faults          (vec (:nemesis opts))
+        attack-duration (:nemesis-attack-duration opts)
+        rest-duration   (:nemesis-rest-duration opts)
 
-        nc-faults (filter #{:partition :clock :pause} (:nemesis opts))
+        nc-faults (filter #{:partition :clock :pause} faults)
         nc-pkgs   (nc/nemesis-packages
-                    {:db       the-db
-                     :nodes    (:nodes opts)
-                     :faults   nc-faults
+                    {:db        the-db
+                     :nodes     (:nodes opts)
+                     :faults    nc-faults
                      :partition {:targets [:one]}
                      :pause     {:targets [:one]}
-                     :interval (:nemesis-interval opts)})
+                     :clock     {:drift 60}
+                     :interval  attack-duration})
 
-        svc-pkg   (service-package
-                    {:faults   (:nemesis opts)
-                     :interval (:nemesis-interval opts)
-                     :nodes    (:nodes opts)})
+        svc-pkg (service-package
+                  {:faults   faults
+                   :interval attack-duration
+                   :nodes    (:nodes opts)})
 
-        all-pkgs  (remove nil?
-                    (concat
-                      (filter (fn [p] (some? (:generator p))) nc-pkgs)
-                      [svc-pkg]))
+        all-pkgs (remove nil?
+                   (concat
+                     (filter (fn [package]
+                               (some? (:generator package)))
+                             nc-pkgs)
+                     [svc-pkg]))
 
-        nemesis   (if (seq all-pkgs)
-                    (nc/compose-packages all-pkgs)
-                    {:nemesis         nemesis/noop
-                     :generator       nil
-                     :final-generator nil
-                     :perf            #{}})
+        composed (if (seq all-pkgs)
+                   (nc/compose-packages all-pkgs)
+                   {:nemesis         nemesis/noop
+                    :generator       nil
+                    :final-generator nil
+                    :perf            #{}})
 
-        nem-gen   (:generator nemesis)
-        final-gen (:final-generator nemesis)]
+        nem-gen (when (seq faults)
+                  (strict-nemesis-cycle faults
+                                        (:nodes opts)
+                                        attack-duration
+                                        rest-duration))
+        final-gen (:final-generator composed)]
 
     (merge tests/noop-test
            opts
@@ -331,9 +377,10 @@
             :concurrency-factor 1
             :ssh                {:dummy false :strict-host-key-checking false}
             :client             (:client workload)
-            :nemesis            (:nemesis nemesis)
+            :nemesis            (:nemesis composed)
             :checker            (checker/compose
-                                  {:perf       (checker/perf {:nemeses (:perf nemesis)})
+                                  {:perf       (checker/perf
+                                                 {:nemeses (:perf composed)})
                                    :clock      (checker/clock-plot)
                                    :stats      (checker/stats)
                                    :exceptions (ydb-unhandled-exceptions opts)
@@ -367,8 +414,11 @@
        (map (comp keyword str/trim))
        (mapcat #(get special-nemeses % [%]))))
 
-(defn valid-probability? [v] (and (>= v 0.0) (<= v 1.0)))
-(defn valid-read-replicas? [v] (>= v 0))
+(defn valid-probability? [v]
+  (and (>= v 0.0) (<= v 1.0)))
+
+(defn valid-read-replicas? [v]
+  (>= v 0))
 
 (def cli-opts
   [[nil "--db-name DBNAME"               "YDB database name."
@@ -420,19 +470,23 @@
     :default []
     :parse-fn parse-nemesis-spec
     :validate [(partial every? all-nemesis-faults)
-               (str "Each fault must be one of: " (str/join ", " (map name all-nemesis-faults))
+               (str "Each fault must be one of: "
+                    (str/join ", " (map name all-nemesis-faults))
                     ", all, none.")]]
 
-   [nil "--nemesis-interval SECS"        "Seconds between nemesis operations."
+   [nil "--nemesis-attack-duration SECS"
+    "Seconds for which the selected nemesis attack remains active."
+    :default 5 :parse-fn read-string :validate [pos? "Must be positive"]]
+   [nil "--nemesis-rest-duration SECS"
+    "Seconds to wait after recovery before selecting the next attack."
     :default 5 :parse-fn read-string :validate [pos? "Must be positive"]]
    [nil "--store-type TYPE"              "Store type: 'row' or 'column'."
     :default "row"]])
 
 (defn -main [& args]
-  (cli/run! (merge (cli/single-test-cmd {:test-fn  ydb-test
+  (cli/run! (merge (cli/single-test-cmd {:test-fn ydb-test
                                          :opt-spec cli-opts})
                    (cli/serve-cmd)
                    (clean-valid-cmd))
             args))
-
 
