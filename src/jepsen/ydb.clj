@@ -435,6 +435,8 @@
     :default "jepsen_test"]
    [nil "--topic-name NAME"              "YDB topic name (for topic workloads)."
     :default "jepsen_test_topic"]
+   [nil "--topic-partition-count NUM"    "Fixed number of partitions for topic workloads. Keys are hashed onto these partitions, since the elle generator's key space is unbounded over the life of a test."
+    :default 30 :parse-fn parse-long :validate [pos? "Must be a positive integer"]]
    [nil "--workload-name NAME"           "YDB workload name."
     :default "append"]
    [nil "--model MODEL"                  "Consistency model to check."

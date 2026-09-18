@@ -46,8 +46,8 @@ lein run test \
     --store-type row
 ```
 
-Example command for running the topic-only workload (each key maps to one partition of a
-YDB topic, appends are written transactionally, reads are a full non-destructive replay):
+Example command for running the topic-only workload (keys are hashed onto a fixed number of
+topic partitions, appends are written transactionally, reads are a full non-destructive replay):
 ```bash
 lein run test \
     --nodes-file ~/ydb-nodes.txt \
@@ -57,6 +57,7 @@ lein run test \
     --workload-name append-single-row-to-topic \
     --model ydb-serializable \
     --topic-name jepsen_test_topic \
+    --topic-partition-count 30 \
     --key-count 15 \
     --max-writes-per-key 1000 \
     --max-txn-length 4
