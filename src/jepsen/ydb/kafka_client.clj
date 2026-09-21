@@ -1,0 +1,213 @@
+(ns jepsen.ydb.kafka-client
+  (:require [jepsen.util :as util])
+  (:import (java.time Duration)
+           (java.util Properties)
+           (java.util.concurrent ExecutionException)
+           (org.apache.kafka.clients.consumer ConsumerConfig KafkaConsumer)
+           (org.apache.kafka.clients.producer KafkaProducer ProducerConfig)
+           (org.apache.kafka.common KafkaException)
+           (org.apache.kafka.common.errors AuthorizationException
+                                            DisconnectException
+                                            InterruptException
+                                            InvalidProducerEpochException
+                                            InvalidTopicException
+                                            NetworkException
+                                            NotLeaderOrFollowerException
+                                            OutOfOrderSequenceException
+                                            ProducerFencedException
+                                            TimeoutException
+                                            UnknownServerException
+                                            UnknownTopicOrPartitionException
+                                            UnsupportedVersionException)))
+
+(def consumer-group
+  "sendOffsetsToTransaction requires a group id even for assign-only consumers."
+  "jepsen-kafka-topic")
+
+(def serializer "org.apache.kafka.common.serialization.LongSerializer")
+(def deserializer "org.apache.kafka.common.serialization.LongDeserializer")
+
+(def run-id
+  "Makes transactional ids unique across test runs."
+  (str (random-uuid)))
+
+(def next-transactional-id (atom -1))
+
+(defn new-transactional-id
+  []
+  (str "jepsen-" run-id "-" (swap! next-transactional-id inc)))
+
+(defn ^Properties ->properties
+  [m]
+  (doto (Properties.)
+    (.putAll (util/map-vals str m))))
+
+(defn bootstrap-servers
+  [test node]
+  (str node ":" (:kafka-port test)))
+
+(defn jaas-config
+  [mechanism username password]
+  (let [login-module (case mechanism
+                       "PLAIN" "org.apache.kafka.common.security.plain.PlainLoginModule"
+                       ("SCRAM-SHA-256" "SCRAM-SHA-512")
+                       "org.apache.kafka.common.security.scram.ScramLoginModule")]
+    (format "%s required username=\"%s\" password=\"%s\";" login-module username password)))
+
+(defn auth-config
+  "Client properties for SASL authentication. Empty unless a mechanism is
+   configured, which leaves the client on PLAINTEXT."
+  [test]
+  (if-let [mechanism (:kafka-sasl-mechanism test)]
+    {"security.protocol" "SASL_PLAINTEXT"
+     "sasl.mechanism"    mechanism
+     "sasl.jaas.config"  (jaas-config mechanism
+                                      (:kafka-username test)
+                                      (:kafka-password test))}
+    {}))
+
+(defn producer-config
+  [test node transactional-id]
+  (merge
+   (cond-> {ProducerConfig/BOOTSTRAP_SERVERS_CONFIG                    (bootstrap-servers test node)
+            ProducerConfig/KEY_SERIALIZER_CLASS_CONFIG                 serializer
+            ProducerConfig/VALUE_SERIALIZER_CLASS_CONFIG               serializer
+            ; YDB's Kafka API doesn't support compression.
+            ProducerConfig/COMPRESSION_TYPE_CONFIG                     "none"
+            ProducerConfig/ACKS_CONFIG                                 "all"
+            ProducerConfig/DELIVERY_TIMEOUT_MS_CONFIG                  15000
+            ProducerConfig/REQUEST_TIMEOUT_MS_CONFIG                   5000
+            ProducerConfig/MAX_BLOCK_MS_CONFIG                         15000
+            ProducerConfig/RECONNECT_BACKOFF_MAX_MS_CONFIG             1000
+            ProducerConfig/SOCKET_CONNECTION_SETUP_TIMEOUT_MS_CONFIG   500
+            ProducerConfig/SOCKET_CONNECTION_SETUP_TIMEOUT_MAX_MS_CONFIG 1000}
+     transactional-id
+     (assoc ProducerConfig/ENABLE_IDEMPOTENCE_CONFIG true
+            ProducerConfig/TRANSACTIONAL_ID_CONFIG   transactional-id
+            ProducerConfig/TRANSACTION_TIMEOUT_CONFIG (:kafka-transaction-timeout-ms test)))
+   (auth-config test)))
+
+(defn consumer-config
+  [test node]
+  (merge
+   {ConsumerConfig/BOOTSTRAP_SERVERS_CONFIG                    (bootstrap-servers test node)
+    ConsumerConfig/KEY_DESERIALIZER_CLASS_CONFIG               deserializer
+    ConsumerConfig/VALUE_DESERIALIZER_CLASS_CONFIG             deserializer
+    ConsumerConfig/GROUP_ID_CONFIG                             consumer-group
+    ConsumerConfig/ISOLATION_LEVEL_CONFIG                      (:kafka-isolation-level test)
+    ConsumerConfig/ENABLE_AUTO_COMMIT_CONFIG                   false
+    ConsumerConfig/AUTO_OFFSET_RESET_CONFIG                    "earliest"
+    ConsumerConfig/METADATA_MAX_AGE_CONFIG                     60000
+    ConsumerConfig/REQUEST_TIMEOUT_MS_CONFIG                   10000
+    ConsumerConfig/DEFAULT_API_TIMEOUT_MS_CONFIG               10000
+    ConsumerConfig/CONNECTIONS_MAX_IDLE_MS_CONFIG              60000
+    ConsumerConfig/SOCKET_CONNECTION_SETUP_TIMEOUT_MS_CONFIG   500
+    ConsumerConfig/SOCKET_CONNECTION_SETUP_TIMEOUT_MAX_MS_CONFIG 1000}
+   (auth-config test)))
+
+(defn close-producer!
+  [^KafkaProducer p]
+  (.close p (Duration/ofMillis 0)))
+
+(defn close-consumer!
+  [^KafkaConsumer c]
+  (.close c (Duration/ofMillis 0)))
+
+(defn open-consumer
+  [test node]
+  (KafkaConsumer. (->properties (consumer-config test node))))
+
+(defn open-producer
+  "Opens a producer; when transactional-id is non-nil also initializes transactions."
+  [test node transactional-id]
+  (let [producer (KafkaProducer. (->properties (producer-config test node transactional-id)))]
+    (when transactional-id
+      (try (.initTransactions producer)
+           (catch Throwable t
+             (close-producer! producer)
+             (throw t))))
+    producer))
+
+(defmacro unwrap-errors
+  "Kafka may wrap its exceptions in an ExecutionException (future gets);
+   rethrows the underlying KafkaException instead."
+  [& body]
+  `(try ~@body
+        (catch ExecutionException e#
+          (let [cause# (util/ex-root-cause e#)]
+            (if (instance? KafkaException cause#)
+              (throw cause#)
+              (throw e#))))))
+
+(defmacro with-errors
+  "Evaluates body, which should produce a completed op, converting known Kafka
+   exceptions into :fail/:info completions. `op` is an expression evaluated
+   only when an exception is caught, so it can capture partial progress.
+   Unrecognized exceptions are rethrown."
+  [op & body]
+  `(try (unwrap-errors ~@body)
+        (catch AuthorizationException _#
+          (assoc ~op :type :fail, :error :authorization, :end-process? true))
+
+        (catch DisconnectException e#
+          (assoc ~op :type :info, :error [:disconnect (.getMessage e#)]))
+
+        (catch InvalidProducerEpochException e#
+          (assoc ~op :type :fail, :error [:invalid-producer-epoch (.getMessage e#)]))
+
+        (catch InvalidTopicException _#
+          (assoc ~op :type :fail, :error :invalid-topic))
+
+        (catch NetworkException e#
+          (assoc ~op :type :info, :error [:network (.getMessage e#)]))
+
+        ; Surprisingly not a definite failure, see KAFKA-13574.
+        (catch NotLeaderOrFollowerException _#
+          (assoc ~op :type :info, :error :not-leader-or-follower))
+
+        (catch OutOfOrderSequenceException _#
+          (assoc ~op :type :fail, :error :out-of-order-sequence, :end-process? true))
+
+        (catch ProducerFencedException _#
+          (assoc ~op :type :fail, :error :producer-fenced, :end-process? true))
+
+        (catch UnknownTopicOrPartitionException _#
+          (assoc ~op :type :fail, :error :unknown-topic-or-partition))
+
+        (catch UnknownServerException e#
+          (assoc ~op :type :info, :error [:unknown-server-exception (.getMessage e#)]))
+
+        (catch UnsupportedVersionException e#
+          (assoc ~op :type :fail, :error [:unsupported-version (.getMessage e#)], :end-process? true))
+
+        (catch InterruptException _#
+          (assoc ~op :type :info, :error :interrupted))
+
+        (catch TimeoutException _#
+          (assoc ~op :type :info, :error :kafka-timeout))
+
+        (catch IllegalStateException e#
+          (if (re-find #"Invalid transition attempted" (str (.getMessage e#)))
+            (assoc ~op :type :info, :error [:illegal-transition (.getMessage e#)])
+            (throw e#)))
+
+        (catch KafkaException e#
+          (let [msg# (str (.getMessage e#))]
+            (cond
+              (re-find #"broker is not available" msg#)
+              (assoc ~op :type :fail, :error :broker-not-available)
+
+              (re-find #"Cannot execute transactional method because we are in an error state" msg#)
+              (assoc ~op :type :fail, :error [:txn-in-error-state msg#], :end-process? true)
+
+              (re-find #"Topic or Partition .+? does not exist" msg#)
+              (assoc ~op :type :fail, :error [:topic-partition-does-not-exist msg#])
+
+              (re-find #"Unexpected error in AddOffsetsToTxnResponse" msg#)
+              (assoc ~op :type :fail, :error [:add-offsets msg#])
+
+              (re-find #"Unexpected error in TxnOffsetCommitResponse" msg#)
+              (assoc ~op :type :fail, :error [:txn-offset-commit msg#])
+
+              :else
+              (assoc ~op :type :info, :error [:kafka-exception msg#]))))))

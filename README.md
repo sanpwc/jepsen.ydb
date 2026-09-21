@@ -21,11 +21,21 @@ export JAVA_CMD=$HOME/jdk-21.0.8+9/bin/java
 table_service_config:
     allow_olap_data_query: true
 ```
-7. Runing jepsen tests
+7. To test topics through the Kafka API (`--workload-name kafka-topic`), enable the Kafka proxy
+   in YDB config (`enable_kafka_transactions` is only needed for `--kafka-txn`, which is the default):
+```yaml
+kafka_proxy_config:
+    enable_kafka_proxy: true
+    listening_port: 9092
+    enable_kafka_transactions: true
+```
+8. Runing jepsen tests
 
 Please pay attention that some parameters are incompatible.
 
 - The `--with-opindex` option is only compatible with `--model ydb-serializable`.
+- The `kafka-topic` workload needs `--kafka-partition-count` >= `--key-count`, and ignores `--max-txn-length`
+  (transactions are 4 operations long with `--kafka-txn` and 1 otherwise).
 
 
  Example command for running the test:
@@ -43,7 +53,23 @@ lein run test \
     --ballast-size 1024 \
     --store-type row
 ```
-8. Run http server for observe results:
+ Example command for running the Kafka API topic workload:
+```bash
+lein run test \
+    --nodes-file ~/ydb-nodes.txt \
+    --db-name /your/db/name \
+    --no-ssh \
+    --concurrency 10n \
+    --workload-name kafka-topic \
+    --kafka-port 9092 \
+    --kafka-topic-name jepsen_kafka_topic \
+    --kafka-partition-count 64 \
+    --key-count 15 \
+    --max-writes-per-key 1000 \
+    --kafka-txn \
+    --kafka-isolation-level read_committed
+```
+9. Run http server for observe results:
 ```bash
 lein run serve -p 9000
 ```
