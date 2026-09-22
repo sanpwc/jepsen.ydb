@@ -182,6 +182,8 @@
   (if-not (:txn? test)
     (body-fn)
     (let [^KafkaProducer producer (:producer client)]
+      (when (compare-and-set! (:txn-initialized? client) false true)
+        (kc/init-transactions! producer))
       (.beginTransaction producer)
       (let [result (try (body-fn)
                         (catch Throwable t
@@ -231,6 +233,10 @@
 (defrecord Client [node
                    ^KafkaProducer producer
                    ^KafkaConsumer consumer
+                   ; Per-client (per-worker) flag: has initTransactions been
+                   ; called on this producer yet? Deliberately not done in
+                   ; open! -- see kc/init-transactions!.
+                   txn-initialized?
                    setup?]
   client/Client
   (open! [this test node]
@@ -239,7 +245,8 @@
       (assoc this
              :node node
              :producer producer
-             :consumer (kc/open-consumer test node))))
+             :consumer (kc/open-consumer test node)
+             :txn-initialized? (atom false))))
 
   (setup! [this test]
     (once-per-cluster
@@ -276,7 +283,7 @@
 
 (defn new-client
   [_opts]
-  (Client. nil nil nil (atom false)))
+  (Client. nil nil nil nil (atom false)))
 
 (defn workload
   "jepsen.tests.kafka workload against YDB's Kafka API. Only :sub-via :assign

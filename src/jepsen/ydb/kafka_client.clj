@@ -82,7 +82,8 @@
           username  (if (= mechanism "PLAIN")
                       (plain-username test)
                       (or (:kafka-username test) "jepsen"))
-          password  (or (:kafka-password test) "jepsen")]
+          password  (or (:kafka-password test)
+                        (throw (IllegalArgumentException. "kafka-sasl? is set but no :kafka-password was provided")))]
       {"security.protocol" "SASL_PLAINTEXT"
        "sasl.mechanism"    mechanism
        "sasl.jaas.config"  (jaas-config mechanism username password)})))
@@ -139,15 +140,25 @@
   (KafkaConsumer. (->properties (consumer-config test node))))
 
 (defn open-producer
-  "Opens a producer; when transactional-id is non-nil also initializes transactions."
+  "Opens a producer. Does not call initTransactions even when transactional-id
+   is set -- see init-transactions!."
   [test node transactional-id]
-  (let [producer (KafkaProducer. (->properties (producer-config test node transactional-id)))]
-    (when transactional-id
-      (try (.initTransactions producer)
-           (catch Throwable t
-             (close-producer! producer)
-             (throw t))))
-    producer))
+  (KafkaProducer. (->properties (producer-config test node transactional-id))))
+
+(defn init-transactions!
+  "Initializes transactions on a producer opened with a transactional-id.
+   Deliberately not done as part of open-producer: jepsen calls client/open!
+   for every worker concurrently (jepsen.core/with-client+nemesis-setup-teardown
+   uses real-pmap), so a producer that authenticates eagerly in open! can race
+   against another worker's client/setup! that's still provisioning the SASL
+   user -- see kafka-topic/ensure-user!. Call this instead on the first actual
+   transactional op, once client/setup! is guaranteed to have completed for
+   every worker."
+  [^KafkaProducer producer]
+  (try (.initTransactions producer)
+       (catch Throwable t
+         (close-producer! producer)
+         (throw t))))
 
 (defmacro unwrap-errors
   "Kafka may wrap its exceptions in an ExecutionException (future gets);
