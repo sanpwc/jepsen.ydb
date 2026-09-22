@@ -72,6 +72,26 @@
      (format "CREATE TOPIC `%1$s` WITH (min_active_partitions = %2$d, max_active_partitions = %2$d);"
              (:kafka-topic-name test) (:kafka-partition-count test)))))
 
+(defn ensure-user!
+  "Creates (or, if it already exists, re-passwords) the YDB user the Kafka
+   client authenticates as, and grants it full rights on the database. The
+   Kafka wire protocol has no notion of database, so on YDB the target
+   database is conveyed via the SASL PLAIN username as user@database; that
+   still needs to be a real, authenticated user even when the cluster has
+   anonymous access enabled for plain (non-Kafka) connections."
+  [test query-client]
+  (info "creating kafka api user")
+  (let [username (:kafka-username test)
+        password (:kafka-password test)]
+    (conn/with-session [session query-client]
+      (try
+        (conn/execute-scheme! session (format "CREATE USER %s PASSWORD '%s';" username password))
+        (catch UnexpectedResultException e
+          (if (= (-> e .getStatus .getCode) StatusCode/ALREADY_EXISTS)
+            (conn/execute-scheme! session (format "ALTER USER %s PASSWORD '%s';" username password))
+            (throw e))))
+      (conn/execute-scheme! session (format "GRANT ALL ON `%s` TO %s;" (:db-name test) username)))))
+
 (defn polled-entries
   "All [k [[offset value] ...]] entries from the :poll micro-ops in a txn value."
   [value]
@@ -231,7 +251,9 @@
      (with-open [transport (conn/open-transport test node)
                  query-client (conn/open-query-client transport)]
        (drop-topic! test query-client)
-       (create-topic! test query-client))))
+       (create-topic! test query-client)
+       (when (:kafka-sasl? test)
+         (ensure-user! test query-client)))))
 
   (invoke! [this test op]
     (case (:f op)

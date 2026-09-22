@@ -517,8 +517,10 @@
     :default "PLAIN"
     :validate [#{"PLAIN" "SCRAM-SHA-256" "SCRAM-SHA-512"}
                "Must be PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512"]]
-   [nil "--kafka-username NAME"          "SASL username. With PLAIN, --db-name is appended automatically unless already present."]
-   [nil "--kafka-password PASS"          "SASL password."]
+   [nil "--kafka-username NAME"          "SASL username. Created on the cluster during setup if missing. With PLAIN, --db-name is appended automatically unless already present."
+    :default "jepsen"]
+   [nil "--kafka-password PASS"          "SASL password."
+    :default "jepsen"]
    [nil "--kafka-crash-clients"          "Periodically crash and reopen Kafka clients."
     :id :crash-clients? :default false]
    [nil "--kafka-crash-client-interval SECS" "Seconds between client crashes."
