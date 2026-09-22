@@ -434,6 +434,15 @@
 (defn valid-read-replicas? [v]
   (>= v 0))
 
+(defn random-kafka-password
+  "A random password for the kafka-topic workload's self-provisioned YDB
+   user, generated once per test run rather than checked into source. Hex
+   only, since YDB's default password policy only allows letters, digits,
+   and a specific set of special characters, and this sidesteps that set
+   entirely."
+  []
+  (str/replace (str (random-uuid)) "-" ""))
+
 (def cli-opts
   [[nil "--db-name DBNAME"               "YDB database name."
     :default "/local"]
@@ -519,8 +528,8 @@
                "Must be PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512"]]
    [nil "--kafka-username NAME"          "SASL username. Created on the cluster during setup if missing. With PLAIN, --db-name is appended automatically unless already present."
     :default "jepsen"]
-   [nil "--kafka-password PASS"          "SASL password."
-    :default "jepsen"]
+   [nil "--kafka-password PASS"          "SASL password. Defaults to a fresh random value generated for this run."
+    :default (random-kafka-password)]
    [nil "--kafka-crash-clients"          "Periodically crash and reopen Kafka clients."
     :id :crash-clients? :default false]
    [nil "--kafka-crash-client-interval SECS" "Seconds between client crashes."
