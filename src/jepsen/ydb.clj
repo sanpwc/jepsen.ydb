@@ -511,10 +511,13 @@
                "Must be read_committed or read_uncommitted"]]
    [nil "--kafka-transaction-timeout-ms NUM" "Kafka transaction timeout in ms."
     :default 10000 :parse-fn parse-long :validate [pos? "Must be a positive integer"]]
-   [nil "--kafka-sasl-mechanism NAME"    "SASL mechanism: PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512. PLAINTEXT when omitted."
+   [nil "--[no-]kafka-sasl"              "Authenticate via SASL_PLAINTEXT. Needed on YDB to select the target database over the Kafka protocol; see README."
+    :id :kafka-sasl? :default true]
+   [nil "--kafka-sasl-mechanism NAME"    "SASL mechanism: PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512."
+    :default "PLAIN"
     :validate [#{"PLAIN" "SCRAM-SHA-256" "SCRAM-SHA-512"}
                "Must be PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512"]]
-   [nil "--kafka-username NAME"          "SASL username."]
+   [nil "--kafka-username NAME"          "SASL username. With PLAIN, --db-name is appended automatically unless already present."]
    [nil "--kafka-password PASS"          "SASL password."]
    [nil "--kafka-crash-clients"          "Periodically crash and reopen Kafka clients."
     :id :crash-clients? :default false]

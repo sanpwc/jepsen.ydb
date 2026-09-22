@@ -1,5 +1,6 @@
 (ns jepsen.ydb.kafka-client
-  (:require [jepsen.util :as util])
+  (:require [clojure.string :as str]
+            [jepsen.util :as util])
   (:import (java.time Duration)
            (java.util Properties)
            (java.util.concurrent ExecutionException)
@@ -54,17 +55,37 @@
                        "org.apache.kafka.common.security.scram.ScramLoginModule")]
     (format "%s required username=\"%s\" password=\"%s\";" login-module username password)))
 
-(defn auth-config
-  "Client properties for SASL authentication. Empty unless a mechanism is
-   configured, which leaves the client on PLAINTEXT."
+(defn plain-username
+  "YDB is multi-tenant and the Kafka wire protocol has no notion of database,
+   so which database a topic lives in is conveyed via the SASL PLAIN username
+   as user@database (required only for PLAIN; see
+   https://ydb.tech/docs/en/reference/kafka-api/auth). Without this, the
+   proxy resolves topics against some other (default) database, and produce
+   fails with UNKNOWN_TOPIC_OR_PARTITION. Passing a username that already
+   contains @ overrides this."
   [test]
-  (if-let [mechanism (:kafka-sasl-mechanism test)]
-    {"security.protocol" "SASL_PLAINTEXT"
-     "sasl.mechanism"    mechanism
-     "sasl.jaas.config"  (jaas-config mechanism
-                                      (:kafka-username test)
-                                      (:kafka-password test))}
-    {}))
+  (let [username (or (:kafka-username test) "jepsen")]
+    (if (str/includes? username "@")
+      username
+      (str username "@" (:db-name test)))))
+
+(defn auth-config
+  "Client properties for SASL authentication. Enabled by default (as
+   SASL_PLAINTEXT, no TLS) with a synthetic user, since YDB's anonymous auth
+   accepts any credentials but PLAIN still needs a username to route to the
+   right database, see plain-username. Disable with --no-kafka-sasl for
+   clusters that don't need it."
+  [test]
+  (if-not (:kafka-sasl? test)
+    {}
+    (let [mechanism (:kafka-sasl-mechanism test)
+          username  (if (= mechanism "PLAIN")
+                      (plain-username test)
+                      (or (:kafka-username test) "jepsen"))
+          password  (or (:kafka-password test) "jepsen")]
+      {"security.protocol" "SASL_PLAINTEXT"
+       "sasl.mechanism"    mechanism
+       "sasl.jaas.config"  (jaas-config mechanism username password)})))
 
 (defn producer-config
   [test node transactional-id]

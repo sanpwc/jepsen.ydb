@@ -36,6 +36,12 @@ Please pay attention that some parameters are incompatible.
 - The `--with-opindex` option is only compatible with `--model ydb-serializable`.
 - The `kafka-topic` workload needs `--kafka-partition-count` >= `--key-count`, and ignores `--max-txn-length`
   (transactions are 4 operations long with `--kafka-txn` and 1 otherwise).
+- The `kafka-topic` workload authenticates via `SASL_PLAINTEXT/PLAIN` by default (`--kafka-sasl`), even when
+  the YDB cluster has anonymous auth enabled: YDB is multi-tenant but the Kafka protocol has no notion of
+  database, so the target `--db-name` is conveyed as `user@database` in the SASL username (required by YDB
+  only for the `PLAIN` mechanism). Without this, the proxy resolves topics against some other database and
+  produces fail with `UNKNOWN_TOPIC_OR_PARTITION`. Use `--no-kafka-sasl` only if your cluster doesn't need
+  this.
 
 
  Example command for running the test:
