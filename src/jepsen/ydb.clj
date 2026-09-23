@@ -518,8 +518,13 @@
     :default "read_committed"
     :validate [#{"read_committed" "read_uncommitted"}
                "Must be read_committed or read_uncommitted"]]
-   [nil "--kafka-transaction-timeout-ms NUM" "Kafka transaction timeout in ms."
-    :default 10000 :parse-fn parse-long :validate [pos? "Must be a positive integer"]]
+   [nil "--kafka-transaction-timeout-ms NUM"
+    "Kafka transaction timeout in ms. Must stay above the producer's
+     delivery.timeout.ms (15000, see kafka-client/producer-config) -- otherwise
+     the transaction coordinator can time out and abort a transaction while a
+     send is still legitimately retrying, and comfortably below the server's
+     kafka_proxy_config.transaction_timeout_ms (default 300000)."
+    :default 30000 :parse-fn parse-long :validate [pos? "Must be a positive integer"]]
    [nil "--[no-]kafka-sasl"              "Authenticate via SASL_PLAINTEXT. Needed on YDB to select the target database over the Kafka protocol; see README."
     :id :kafka-sasl? :default true]
    [nil "--kafka-sasl-mechanism NAME"    "SASL mechanism: PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512."
@@ -527,16 +532,27 @@
     :validate [#{"PLAIN" "SCRAM-SHA-256" "SCRAM-SHA-512"}
                "Must be PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512"]]
    [nil "--kafka-username NAME"          "SASL username. Created on the cluster during setup if missing. With PLAIN, --db-name is appended automatically unless already present."
-    :default "jepsen"]
+    :default "jepsen"
+    :validate [#(not (str/includes? % "'")) "Must not contain a single quote (used unescaped in YQL)"]]
    [nil "--kafka-password PASS"          "SASL password. Defaults to a fresh random value generated for this run."
-    :default (random-kafka-password)]
+    :default (random-kafka-password)
+    :validate [#(not (str/includes? % "'")) "Must not contain a single quote (used unescaped in YQL)"]]
    [nil "--kafka-crash-clients"          "Periodically crash and reopen Kafka clients."
     :id :crash-clients? :default false]
    [nil "--kafka-crash-client-interval SECS" "Seconds between client crashes."
     :id :crash-client-interval :default 30 :parse-fn parse-long
     :validate [pos? "Must be a positive integer"]]
-   [nil "--kafka-final-time-limit SECS"  "Seconds allowed for the workload final generator."
-    :default 30 :parse-fn parse-long :validate [pos? "Must be a positive integer"]]])
+   [nil "--kafka-final-time-limit SECS"
+    "Seconds allowed for the workload final generator (jepsen.tests.kafka's
+     catch-up read of every key, seeking to the beginning of each partition).
+     jepsen.tests.kafka's own generator has no meaningful time budget of its
+     own here -- it keeps polling until every key is caught up -- so this is
+     the only real cutoff. Too low a value for the configured --key-count/
+     --max-writes-per-key/--concurrency cuts the catch-up read off before it
+     finishes, which the checker can't distinguish from genuine data loss:
+     it'll report spurious :unseen failures on an otherwise-correct run.
+     Scale this up for larger workloads."
+    :default 300 :parse-fn parse-long :validate [pos? "Must be a positive integer"]]])
 
 (defn -main [& args]
   (cli/run! (merge (cli/single-test-cmd {:test-fn ydb-test

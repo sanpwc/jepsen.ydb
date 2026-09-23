@@ -81,7 +81,7 @@
    (non-Kafka) connections."
   [test query-client]
   (info "creating kafka api user")
-  (let [username (:kafka-username test)
+  (let [username (kc/ydb-username test)
         password (:kafka-password test)]
     (conn/with-session [session query-client]
       (conn/execute-scheme! session (format "DROP USER IF EXISTS %s;" username))
@@ -245,7 +245,7 @@
       (assoc this
              :node node
              :producer producer
-             :consumer (kc/open-consumer test node)
+             :consumer (kc/open-consumer test node (kc/new-group-id))
              :txn-initialized? (atom false))))
 
   (setup! [this test]

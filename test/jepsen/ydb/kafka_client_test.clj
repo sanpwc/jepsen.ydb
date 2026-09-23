@@ -17,6 +17,14 @@
   (testing "An explicit @ is left alone"
     (is (= "u@/other" (kc/plain-username {:kafka-username "u@/other" :db-name "/local"})))))
 
+(deftest ydb-username
+  (testing "Left alone when there's no @"
+    (is (= "u" (kc/ydb-username {:kafka-username "u"}))))
+  (testing "Strips an @database suffix, the inverse of plain-username"
+    (is (= "u" (kc/ydb-username {:kafka-username "u@/local"}))))
+  (testing "Defaults to the synthetic username"
+    (is (= "jepsen" (kc/ydb-username {})))))
+
 (deftest auth-config
   (testing "Disabled explicitly"
     (is (= {} (kc/auth-config {:kafka-sasl? false}))))
@@ -53,13 +61,20 @@
     (testing "Non-transactional producers have no transactional id"
       (is (not (contains? (kc/producer-config test "n1" nil) "transactional.id"))))))
 
+(deftest new-group-id
+  (testing "Group ids are unique across calls"
+    (is (not= (kc/new-group-id) (kc/new-group-id)))))
+
 (deftest consumer-config
   (let [config (kc/consumer-config {:kafka-port 9092
                                     :kafka-isolation-level "read_committed"}
-                                   "n1")]
-    (testing "A group id is always set"
-      (is (= kc/consumer-group (get config "group.id"))))
+                                   "n1"
+                                   "group-1")]
+    (testing "Group id comes from the caller, not a shared constant"
+      (is (= "group-1" (get config "group.id"))))
     (testing "Isolation level comes from the test"
       (is (= "read_committed" (get config "isolation.level"))))
     (testing "Auto commit is off"
-      (is (= false (get config "enable.auto.commit"))))))
+      (is (= false (get config "enable.auto.commit"))))
+    (testing "CRC checks are off (unsupported by YDB's Kafka API)"
+      (is (= false (get config "check.crcs"))))))

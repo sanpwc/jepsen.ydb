@@ -21,10 +21,6 @@
                                             UnknownTopicOrPartitionException
                                             UnsupportedVersionException)))
 
-(def consumer-group
-  "sendOffsetsToTransaction requires a group id even for assign-only consumers."
-  "jepsen-kafka-topic")
-
 (def serializer "org.apache.kafka.common.serialization.LongSerializer")
 (def deserializer "org.apache.kafka.common.serialization.LongDeserializer")
 
@@ -37,6 +33,23 @@
 (defn new-transactional-id
   []
   (str "jepsen-" run-id "-" (swap! next-transactional-id inc)))
+
+(def next-group-id (atom -1))
+
+(defn new-group-id
+  "A fresh, unique Kafka consumer group id. sendOffsetsToTransaction requires
+   a group id even for assign-only consumers (it's how it obtains
+   ConsumerGroupMetadata), but the id must not be shared across clients: after
+   a plain .assign() without :seek-to-beginning?, the Kafka client resolves
+   each partition's fetch position by first fetching the group's last
+   committed offset, falling back to auto.offset.reset only when there isn't
+   one. A group id shared across jepsen workers would let one worker's assign
+   silently jump to an offset committed by a different worker's transaction,
+   instead of starting at auto.offset.reset=earliest -- surfacing as
+   int-poll-skip/unseen. Called once per client open (not once per test), so
+   a :crash-driven reopen also gets a clean group with no stale commits."
+  []
+  (str "jepsen-" run-id "-" (swap! next-group-id inc)))
 
 (defn ^Properties ->properties
   [m]
@@ -69,6 +82,17 @@
       username
       (str username "@" (:db-name test)))))
 
+(defn ydb-username
+  "The actual YDB identity to CREATE/GRANT/authenticate as -- the inverse of
+   plain-username: --kafka-username may already contain @database (see
+   plain-username), but that suffix is only meaningful in the SASL PLAIN wire
+   value, not as part of a YDB user name. Using it unstripped in YQL either
+   fails to parse or creates a user that the server can never match against
+   the un-suffixed name it extracts from the SASL login."
+  [test]
+  (let [username (or (:kafka-username test) "jepsen")]
+    (first (str/split username #"@" 2))))
+
 (defn auth-config
   "Client properties for SASL authentication. Enabled by default (as
    SASL_PLAINTEXT, no TLS) with a synthetic user, since YDB's anonymous auth
@@ -97,6 +121,9 @@
             ; YDB's Kafka API doesn't support compression.
             ProducerConfig/COMPRESSION_TYPE_CONFIG                     "none"
             ProducerConfig/ACKS_CONFIG                                 "all"
+            ; Must stay below --kafka-transaction-timeout-ms (see ydb.clj): if a
+            ; transaction outlives a send that's still legitimately retrying,
+            ; the coordinator can abort it out from under the producer.
             ProducerConfig/DELIVERY_TIMEOUT_MS_CONFIG                  15000
             ProducerConfig/REQUEST_TIMEOUT_MS_CONFIG                   5000
             ProducerConfig/MAX_BLOCK_MS_CONFIG                         15000
@@ -110,14 +137,17 @@
    (auth-config test)))
 
 (defn consumer-config
-  [test node]
+  [test node group-id]
   (merge
    {ConsumerConfig/BOOTSTRAP_SERVERS_CONFIG                    (bootstrap-servers test node)
     ConsumerConfig/KEY_DESERIALIZER_CLASS_CONFIG               deserializer
     ConsumerConfig/VALUE_DESERIALIZER_CLASS_CONFIG             deserializer
-    ConsumerConfig/GROUP_ID_CONFIG                             consumer-group
+    ConsumerConfig/GROUP_ID_CONFIG                             group-id
     ConsumerConfig/ISOLATION_LEVEL_CONFIG                      (:kafka-isolation-level test)
     ConsumerConfig/ENABLE_AUTO_COMMIT_CONFIG                   false
+    ; YDB's Kafka API doesn't support CRC checks; the client's default
+    ; check.crcs=true throws CorruptRecordException on every fetch.
+    ConsumerConfig/CHECK_CRCS_CONFIG                           false
     ConsumerConfig/AUTO_OFFSET_RESET_CONFIG                    "earliest"
     ConsumerConfig/METADATA_MAX_AGE_CONFIG                     60000
     ConsumerConfig/REQUEST_TIMEOUT_MS_CONFIG                   10000
@@ -136,8 +166,8 @@
   (.close c (Duration/ofMillis 0)))
 
 (defn open-consumer
-  [test node]
-  (KafkaConsumer. (->properties (consumer-config test node))))
+  [test node group-id]
+  (KafkaConsumer. (->properties (consumer-config test node group-id))))
 
 (defn open-producer
   "Opens a producer. Does not call initTransactions even when transactional-id

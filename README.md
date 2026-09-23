@@ -22,11 +22,17 @@ table_service_config:
     allow_olap_data_query: true
 ```
 7. To test topics through the Kafka API (`--workload-name kafka-topic`), enable the Kafka proxy
-   in YDB config (`enable_kafka_transactions` is only needed for `--kafka-txn`, which is the default):
+   in YDB config:
 ```yaml
 kafka_proxy_config:
     enable_kafka_proxy: true
     listening_port: 9092
+```
+   `--kafka-txn` (the default) needs the `EnableKafkaTransactions` feature flag, which is a top-level
+   `feature_flags` entry, not part of `kafka_proxy_config`, and defaults to `true` -- most clusters
+   need no extra config for it. Only set it explicitly if your cluster has it turned off:
+```yaml
+feature_flags:
     enable_kafka_transactions: true
 ```
 8. Runing jepsen tests
@@ -42,6 +48,11 @@ Please pay attention that some parameters are incompatible.
   only for the `PLAIN` mechanism). Without this, the proxy resolves topics against some other database and
   produces fail with `UNKNOWN_TOPIC_OR_PARTITION`. Use `--no-kafka-sasl` only if your cluster doesn't need
   this.
+- The `kafka-topic` workload's end-of-test catch-up read (which re-reads every key from the beginning to
+  check nothing was lost) is only bounded by `--kafka-final-time-limit` (default 300s) -- too low a value
+  for the configured `--key-count`/`--max-writes-per-key`/`--concurrency` cuts it off before it's done
+  reading, which shows up as spurious `:unseen` failures on an otherwise-correct run. Scale it up for
+  larger workloads.
 
 
  Example command for running the test:
