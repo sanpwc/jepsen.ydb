@@ -53,6 +53,21 @@ Please pay attention that some parameters are incompatible.
   for the configured `--key-count`/`--max-writes-per-key`/`--concurrency` cuts it off before it's done
   reading, which shows up as spurious `:unseen` failures on an otherwise-correct run. Scale it up for
   larger workloads.
+- The `topic-table` workload mixes table and topic operations inside single YDB transactions (native SDK,
+  `TxMode.SERIALIZABLE_RW` only -- YQL alone can't do this), to catch atomicity violations between the two
+  APIs. It requires `--model ydb-serializable`. Table keys work exactly like the `append` workload; each
+  topic key, however, is touched at most once per transaction (one `:r` or one `:append`, never both) --
+  this is intentional, not a limitation of the checker setup: YDB topics don't make a transaction's own
+  writes visible to reads within that same transaction, and a topic replay read isn't tied to any
+  transaction snapshot, so allowing more than one touch would surface false-positive
+  read-your-own-writes/repeatable-read anomalies that are inherent to topic semantics, not real bugs (this
+  is exactly what an earlier topics-only proof of concept ran into). Topic reads/write-your-own-writes
+  consistency is intentionally out of scope here and is covered separately by `kafka-topic`. Use
+  `--table-key-count`/`--topic-key-count` to size the two key spaces (their sum becomes the workload's
+  effective `--key-count`) and `--topic-partition-count`/`--topic-name` to configure the topic. Its
+  end-of-test read sweep (every topic key touched during the run, read back once) is governed by the same
+  `--kafka-final-time-limit` as `kafka-topic`, despite the flag's name -- it's shared final-generator
+  plumbing, not Kafka-specific.
 
 
  Example command for running the test:
@@ -85,6 +100,22 @@ lein run test \
     --max-writes-per-key 1000 \
     --kafka-txn \
     --kafka-isolation-level read_committed
+```
+ Example command for running the mixed table+topic workload:
+```bash
+lein run test \
+    --nodes-file ~/ydb-nodes.txt \
+    --db-name /your/db/name \
+    --no-ssh \
+    --concurrency 10n \
+    --workload-name topic-table \
+    --model ydb-serializable \
+    --topic-name jepsen_test_topic \
+    --topic-partition-count 30 \
+    --table-key-count 10 \
+    --topic-key-count 10 \
+    --max-writes-per-key 1000 \
+    --store-type row
 ```
 9. Run http server for observe results:
 ```bash
