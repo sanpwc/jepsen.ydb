@@ -15,6 +15,7 @@
    reused across the combined table+topic keyspace without a topic-specific
    checker."
   (:require [jepsen.client :as client]
+            [jepsen.generator :as gen]
             [jepsen.tests.cycle.append :as append]
             [jepsen.ydb.append :as table]
             [jepsen.ydb.conn :as conn]
@@ -84,7 +85,20 @@
 (defn simplify-topic-mops
   "Given a transaction's micro-ops, drops every micro-op after the first one
    touching a given topic key (whether that first one is a :r or an
-   :append). Table-key micro-ops are always kept unchanged, in any number."
+   :append). Table-key micro-ops are always kept unchanged, in any number.
+
+   Applied at the GENERATOR level (see workload, via gen/map), not
+   client-side in invoke! -- Elle's checker (elle.txn/intermediate-write-
+   indices, used for G1b/intermediate-read detection, and potentially other
+   analyses) reads straight from the raw history, including :invoke entries,
+   which Jepsen always logs with the exact value the generator produced,
+   before any client ever sees it. If we simplified only inside invoke! (as
+   an earlier version of this code did), the :invoke entry would still show
+   the original, never-executed extra touches of a topic key, and Elle would
+   treat those phantom writes as real, flagging later legitimate reads as
+   false-positive intermediate reads (G1b). Simplifying at the generator
+   means the :invoke entry Jepsen logs already matches what actually runs,
+   so there's nothing for the checker to misread."
   [test mops]
   (let [seen (volatile! #{})]
     (vec (filter (fn [[_ k _]]
@@ -130,12 +144,13 @@
           (conn/with-session [session query-client]
             (conn/with-transaction [tx [session (:model test)]]
               (let [txn (:value op)
-                    txn' (simplify-topic-mops test txn)
-                    op' (if (not= txn txn') (assoc op :modified-txn txn') op)
-                    txn'' (->> txn'
-                               (mapcat (partial apply-mop! test tx topic-client writers))
-                               (into []))]
-                (assoc op' :type :ok, :value txn''))))))))
+                    ; txn is already simplified by the generator (see
+                    ; workload/simplify-topic-mops) -- nothing to do here but
+                    ; execute it.
+                    txn' (->> txn
+                              (mapcat (partial apply-mop! test tx topic-client writers))
+                              (into []))]
+                (assoc op :type :ok, :value txn'))))))))
 
   (teardown! [this test])
 
@@ -152,11 +167,21 @@
   [opts]
   (Client. nil nil nil (atom {}) (table/new-ballast (:ballast-size opts)) (atom false)))
 
+(defn simplify-topic-mops-in-op
+  "Transforms a generated op by simplifying its :value -- see
+   simplify-topic-mops. Passed to gen/map so the transaction Jepsen logs at
+   :invoke time is already what will actually run."
+  [opts op]
+  (if (= :txn (:f op))
+    (update op :value (partial simplify-topic-mops opts))
+    op))
+
 (defn workload
   [opts]
   (-> (ydb-serializable/wrap-test
-       (append/test (assoc (select-keys opts [:min-txn-length :max-txn-length :max-writes-per-key])
-                           :key-count (+ (:table-key-count opts) (:topic-key-count opts))
-                           :consistency-models [(:model opts)])))
+       (update (append/test (assoc (select-keys opts [:min-txn-length :max-txn-length :max-writes-per-key])
+                                   :key-count (+ (:table-key-count opts) (:topic-key-count opts))
+                                   :consistency-models [(:model opts)]))
+               :generator (partial gen/map (partial simplify-topic-mops-in-op opts))))
       (assoc :client (new-client opts)
              :final-generator (new-final-reads-gen))))
