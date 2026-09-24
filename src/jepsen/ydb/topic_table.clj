@@ -167,14 +167,27 @@
   [opts]
   (Client. nil nil nil (atom {}) (table/new-ballast (:ballast-size opts)) (atom false)))
 
-(defn simplify-topic-mops-in-op
-  "Transforms a generated op by simplifying its :value -- see
+(defn new-simplify-topic-mops-in-op
+  "Builds a single-arity fn (NOT via partial/clojure.core -- see below) that
+   transforms a generated op by simplifying its :value -- see
    simplify-topic-mops. Passed to gen/map so the transaction Jepsen logs at
-   :invoke time is already what will actually run."
-  [opts op]
-  (if (= :txn (:f op))
-    (update op :value (partial simplify-topic-mops opts))
-    op))
+   :invoke time is already what will actually run.
+
+   Must be a plain (fn [op] ...) closure, not (partial f opts): gen/map
+   picks which arity to call f with (1 or 3 args) by reflecting on
+   (.getDeclaredMethods (class f)) for the highest-arity `invoke` method it
+   finds. clojure.core/partial's returned function genuinely implements
+   invoke at several arities (0, 1, 2, 3, & more), all of which just forward
+   to the wrapped function with the fixed args prepended -- so reflection
+   sees a spurious 3-arg invoke and gen/map calls it as (f op test ctx),
+   which prepends opts too and calls the real 2-arity fn with 4 args,
+   throwing ArityException. A plain (fn [op] ...) only ever has a genuine
+   1-arg invoke, so reflection reports arity 1 correctly."
+  [opts]
+  (fn [op]
+    (if (= :txn (:f op))
+      (update op :value (partial simplify-topic-mops opts))
+      op)))
 
 (defn workload
   [opts]
@@ -182,6 +195,6 @@
        (update (append/test (assoc (select-keys opts [:min-txn-length :max-txn-length :max-writes-per-key])
                                    :key-count (+ (:table-key-count opts) (:topic-key-count opts))
                                    :consistency-models [(:model opts)]))
-               :generator (partial gen/map (partial simplify-topic-mops-in-op opts))))
+               :generator (partial gen/map (new-simplify-topic-mops-in-op opts))))
       (assoc :client (new-client opts)
              :final-generator (new-final-reads-gen))))
