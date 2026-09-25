@@ -55,14 +55,20 @@ Please pay attention that some parameters are incompatible.
   larger workloads.
 - The `topic-table` workload mixes table and topic operations inside single YDB transactions (native SDK,
   `TxMode.SERIALIZABLE_RW` only -- YQL alone can't do this), to catch atomicity violations between the two
-  APIs. It requires `--model ydb-serializable`. Table keys work exactly like the `append` workload; each
-  topic key, however, is touched at most once per transaction (one `:r` or one `:append`, never both) --
-  this is intentional, not a limitation of the checker setup: YDB topics don't make a transaction's own
-  writes visible to reads within that same transaction, and a topic replay read isn't tied to any
-  transaction snapshot, so allowing more than one touch would surface false-positive
-  read-your-own-writes/repeatable-read anomalies that are inherent to topic semantics, not real bugs (this
-  is exactly what an earlier topics-only proof of concept ran into). Topic reads/write-your-own-writes
-  consistency is intentionally out of scope here and is covered separately by `kafka-topic`. Use
+  APIs. It requires `--model ydb-serializable`. Table keys work exactly like the `append` workload -- any
+  number of reads/writes, freely mixed. Topic-key reads are deliberately restricted, and writes are not:
+  (1) a topic read is dropped if that same key was already appended to earlier in the same transaction
+  (topics don't make a transaction's own writes visible to reads within that same transaction, so keeping
+  such a read would look like an internal-consistency violation), and (2) once any topic read survives
+  rule 1, every *other* read in the transaction is dropped -- table reads included -- because
+  `execute-topic-read!` isn't attached to the transaction (it can't be snapshot-pinned regardless), so two
+  or more reads where at least one is a topic read can each reflect a different, independent moment in
+  real time, producing a torn view no valid serialization order could explain. Writes are never restricted
+  -- they only take effect atomically at commit, so they can't observe a torn view. This is intentional,
+  not a limitation of the checker setup: an earlier, less restrictive version of this workload hit exactly
+  these false-positive anomalies, both in an earlier topics-only proof of concept and in a real run of this
+  workload itself. Topic reads/write-your-own-writes consistency is intentionally out of scope here and is
+  covered separately by `kafka-topic`. Use
   `--table-key-count`/`--topic-key-count` to size the two key spaces (their sum becomes the workload's
   effective `--key-count`) and `--topic-partition-count`/`--topic-name` to configure the topic. Its
   end-of-test read sweep (every topic key touched during the run, read back once) is governed by the same

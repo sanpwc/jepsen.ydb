@@ -2,18 +2,20 @@
   "Mixes table and topic operations inside single YDB transactions to catch
    atomicity violations between the SQL API and the Topic API (see issue
    ydb-platform/jepsen.ydb#30). Table-key micro-ops are unrestricted, exactly
-   like jepsen.ydb.append. Topic-key micro-ops are restricted to at most one
-   touch per key per transaction (see simplify-topic-mops): topic own-writes
-   are invisible within the same transaction, and replay reads aren't
-   snapshot-isolated, so an unrestricted mix would surface false-positive
-   read-your-own-writes / repeatable-read anomalies that are inherent to
-   topic semantics, not atomicity bugs (this is exactly what happened in the
-   topics-only POC on branch topic-poc). Restricting to a single touch per
-   topic key per transaction makes topic reads/writes behave, from the
-   checker's point of view, like ordinary list-append operations -- so the
-   unmodified Elle list-append checker (via jepsen.tests.cycle.append) can be
-   reused across the combined table+topic keyspace without a topic-specific
-   checker."
+   like jepsen.ydb.append. Topic-key micro-ops are restricted (see
+   simplify-topic-mops for the exact rules): topic own-writes are invisible
+   within the same transaction, and a topic replay read isn't pinned to the
+   transaction's snapshot, so an unrestricted mix would surface
+   false-positive read-your-own-writes / repeatable-read / torn-read
+   anomalies that are inherent to topic semantics, not atomicity bugs (this
+   is exactly what happened in the topics-only POC on branch topic-poc, and
+   in a real cluster run of an earlier, insufficiently-restricted version of
+   this workload). Writes are always unrestricted -- they only take effect
+   atomically at commit. Restricting reads makes topic reads/writes behave,
+   from the checker's point of view, like ordinary list-append operations --
+   so the unmodified Elle list-append checker (via jepsen.tests.cycle.append)
+   can be reused across the combined table+topic keyspace without a
+   topic-specific checker."
   (:require [jepsen.client :as client]
             [jepsen.generator :as gen]
             [jepsen.tests.cycle.append :as append]
@@ -37,9 +39,10 @@
    Jepsen release), so jepsen.tests.cycle.append/test provides no built-in
    guarantee that every key gets read again before the test ends. That
    matters more here than for table-only workloads: simplify-topic-mops
-   deliberately touches each topic key at most once per transaction, so
-   without an explicit final sweep, a topic key's only :append could go
-   completely unobserved by any read for the rest of the test."
+   restricts reads of topic keys much more heavily than table keys (see its
+   docstring), so a given topic key's :append(s) are comparatively unlikely
+   to ever be read back again by the ordinary random generator alone,
+   without an explicit final sweep."
   (atom #{}))
 
 (defn new-final-reads-gen
@@ -83,9 +86,37 @@
   (< (mod (long k) (total-key-count test)) (:topic-key-count test)))
 
 (defn simplify-topic-mops
-  "Given a transaction's micro-ops, drops every micro-op after the first one
-   touching a given topic key (whether that first one is a :r or an
-   :append). Table-key micro-ops are always kept unchanged, in any number.
+  "Given a transaction's micro-ops, returns a simplified vector safe to run
+   against topics that aren't snapshot-isolated within a transaction. Two
+   rules, applied in order:
+
+   1. Drops a topic-key read if that same key was already appended to
+      earlier in this transaction. Topic own-writes aren't visible within
+      the same transaction, so a read immediately reflecting them would
+      look like an internal-consistency violation to Elle (this is the
+      original per-key read-your-own-writes/repeatable-read concern from
+      the abandoned topics-only POC on branch topic-poc). A read that
+      precedes the write to the same key is unaffected -- it isn't
+      expected to see a write that, in program order, hasn't happened yet.
+
+   2. After (1), if any topic-key read remains, keeps only the FIRST one
+      and drops every OTHER read in the transaction -- table reads
+      included. execute-topic-read! isn't attached to the transaction (a
+      topic replay read can't be snapshot-pinned regardless -- see its
+      docstring), so it reflects an independent point in real time. Two or
+      more reads in one transaction, where at least one is a topic read,
+      can therefore observe two different, mutually inconsistent moments
+      -- e.g. a transaction reading topic key A and table key B could see
+      A already reflecting some other transaction T's atomic write to both
+      A and B, while B still reflects pre-T state (or vice versa), a torn
+      view no valid serialization order could produce. Elle would
+      correctly flag this as impossible, but the actual cause would be our
+      own non-snapshot topic reads, not a real YDB bug. Restricting to at
+      most one read per transaction whenever a topic key is involved
+      removes anything for a second, differently-timed read to tear
+      against. Writes are unrestricted throughout -- they only take
+      effect atomically at commit, so they never observe a torn view the
+      way a second read could.
 
    Applied at the GENERATOR level (see workload, via gen/map), not
    client-side in invoke! -- Elle's checker (elle.txn/intermediate-write-
@@ -94,19 +125,35 @@
    which Jepsen always logs with the exact value the generator produced,
    before any client ever sees it. If we simplified only inside invoke! (as
    an earlier version of this code did), the :invoke entry would still show
-   the original, never-executed extra touches of a topic key, and Elle would
-   treat those phantom writes as real, flagging later legitimate reads as
-   false-positive intermediate reads (G1b). Simplifying at the generator
-   means the :invoke entry Jepsen logs already matches what actually runs,
-   so there's nothing for the checker to misread."
+   the original, never-executed extra touches, and Elle would treat those
+   phantom writes/reads as real. Simplifying at the generator means the
+   :invoke entry Jepsen logs already matches what actually runs, so there's
+   nothing for the checker to misread."
   [test mops]
-  (let [seen (volatile! #{})]
-    (vec (filter (fn [[_ k _]]
-                   (or (not (topic-key? test k))
-                       (if (contains? @seen k)
-                         false
-                         (do (vswap! seen conj k) true))))
-                 mops))))
+  (let [written (volatile! #{})
+        rule-1 (vec (keep (fn [[f k _ :as mop]]
+                             (cond
+                               (= f :append)
+                               (do (when (topic-key? test k) (vswap! written conj k))
+                                   mop)
+
+                               (and (= f :r) (topic-key? test k) (contains? @written k))
+                               nil
+
+                               :else mop))
+                           mops))
+        first-topic-read-index (->> rule-1
+                                     (map-indexed vector)
+                                     (some (fn [[i [f k _]]]
+                                             (when (and (= f :r) (topic-key? test k)) i))))]
+    (if (nil? first-topic-read-index)
+      rule-1
+      (vec (keep-indexed (fn [i [f _ _ :as mop]]
+                            (cond
+                              (= i first-topic-read-index) mop
+                              (= f :append) mop
+                              :else nil))
+                          rule-1)))))
 
 (defn apply-mop!
   [test tx topic-client writers [f k v :as mop]]

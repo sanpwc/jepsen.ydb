@@ -21,15 +21,37 @@
     (is (false? (topic-table/topic-key? test-map 100004)))))
 
 (deftest simplify-topic-mops-test
-  (testing "Keeps only the first touch of a repeated topic key"
-    (is (= [[:append 0 1] [:r 2 nil]]
-           (topic-table/simplify-topic-mops test-map [[:append 0 1] [:r 0 nil] [:r 2 nil]]))))
-  (testing "A read before a later append of the same topic key also collapses to the read"
-    (is (= [[:r 1 nil]]
-           (topic-table/simplify-topic-mops test-map [[:r 1 nil] [:append 1 5]]))))
-  (testing "Table keys are never touched, however many times they repeat"
-    (is (= [[:append 2 1] [:r 2 nil] [:append 2 2] [:r 3 nil]]
-           (topic-table/simplify-topic-mops test-map [[:append 2 1] [:r 2 nil] [:append 2 2] [:r 3 nil]]))))
-  (testing "A mix of table and topic keys preserves relative order"
-    (is (= [[:append 2 1] [:append 0 9] [:r 3 nil]]
-           (topic-table/simplify-topic-mops test-map [[:append 2 1] [:append 0 9] [:append 0 9] [:r 3 nil]])))))
+  (testing "No topic reads at all: transaction passes through unchanged"
+    (testing "any number of topic writes to different keys, plus table reads/writes"
+      (is (= [[:append 0 1] [:append 1 2] [:r 2 nil] [:append 3 4] [:r 3 nil]]
+             (topic-table/simplify-topic-mops
+               test-map [[:append 0 1] [:append 1 2] [:r 2 nil] [:append 3 4] [:r 3 nil]])))))
+
+  (testing "Rule 1: a topic-key read preceded by an append to that same key is dropped"
+    (is (= [[:append 0 1]]
+           (topic-table/simplify-topic-mops test-map [[:append 0 1] [:r 0 nil]])))
+    (testing "later appends to the same key still survive"
+      (is (= [[:append 0 1] [:append 0 2]]
+             (topic-table/simplify-topic-mops test-map [[:append 0 1] [:r 0 nil] [:append 0 2]])))))
+
+  (testing "Rule 1 does not affect a read that precedes the write to the same key"
+    (is (= [[:r 0 nil] [:append 0 1]]
+           (topic-table/simplify-topic-mops test-map [[:r 0 nil] [:append 0 1]]))))
+
+  (testing "Rule 2: only the first surviving topic-key read is kept, all other reads are dropped"
+    (testing "two different topic keys, both read"
+      (is (= [[:r 0 nil]]
+             (topic-table/simplify-topic-mops test-map [[:r 0 nil] [:r 1 nil]]))))
+    (testing "a topic read and a table read -- the table read is dropped even though topic-specific"
+      (is (= [[:r 0 nil]]
+             (topic-table/simplify-topic-mops test-map [[:r 2 nil] [:r 0 nil]])))
+      (is (= [[:r 0 nil]]
+             (topic-table/simplify-topic-mops test-map [[:r 0 nil] [:r 2 nil]]))))
+    (testing "writes around the kept read all survive"
+      (is (= [[:append 2 1] [:r 0 nil] [:append 1 9]]
+             (topic-table/simplify-topic-mops test-map [[:append 2 1] [:r 0 nil] [:append 1 9]])))))
+
+  (testing "Combined: rule 1 drops the RYOW read, rule 2 then keeps the one remaining topic read"
+    (is (= [[:append 0 5] [:append 0 6] [:r 1 nil]]
+           (topic-table/simplify-topic-mops
+             test-map [[:append 0 5] [:r 0 nil] [:append 0 6] [:r 1 nil]])))))
