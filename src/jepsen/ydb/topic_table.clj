@@ -2,20 +2,30 @@
   "Mixes table and topic operations inside single YDB transactions to catch
    atomicity violations between the SQL API and the Topic API (see issue
    ydb-platform/jepsen.ydb#30). Table-key micro-ops are unrestricted, exactly
-   like jepsen.ydb.append. Topic-key micro-ops are restricted (see
-   simplify-topic-mops for the exact rules): topic own-writes are invisible
-   within the same transaction, and a topic replay read isn't pinned to the
-   transaction's snapshot, so an unrestricted mix would surface
-   false-positive read-your-own-writes / repeatable-read / torn-read
-   anomalies that are inherent to topic semantics, not atomicity bugs (this
-   is exactly what happened in the topics-only POC on branch topic-poc, and
-   in a real cluster run of an earlier, insufficiently-restricted version of
-   this workload). Writes are always unrestricted -- they only take effect
-   atomically at commit. Restricting reads makes topic reads/writes behave,
-   from the checker's point of view, like ordinary list-append operations --
-   so the unmodified Elle list-append checker (via jepsen.tests.cycle.append)
-   can be reused across the combined table+topic keyspace without a
-   topic-specific checker."
+   like jepsen.ydb.append, in any transaction that doesn't read a topic key.
+   A transaction that reads a topic key is heavily restricted (see
+   simplify-topic-mops for the exact rules and why): it collapses down to
+   that one lone read, nothing else -- no other reads, no writes at all,
+   topic or table. Topic own-writes are invisible within the same
+   transaction, and a topic replay read is never attached to the
+   transaction (it can't be snapshot-pinned regardless), so it always runs
+   strictly before the transaction's actual commit point, at a different
+   moment than anything else in that same transaction takes effect. An
+   unrestricted mix would surface false-positive read-your-own-writes /
+   repeatable-read / torn-read / non-atomic-operation anomalies that are
+   inherent to topic semantics and to this timing gap, not atomicity bugs
+   (this is exactly what happened in the topics-only POC on branch
+   topic-poc, and in real cluster runs and code review of earlier,
+   insufficiently-restricted versions of this workload). Writes are always
+   unrestricted in a transaction that doesn't read a topic key -- they only
+   take effect atomically at commit. Restricting reads this way makes a
+   topic read behave, from the checker's point of view, like an isolated
+   observation rather than part of a torn multi-key transaction -- so the
+   unmodified Elle list-append checker (via jepsen.tests.cycle.append) can
+   be reused across the combined table+topic keyspace without a
+   topic-specific checker, and cross-transaction atomicity is still
+   detected via realtime ordering (see jepsen.ydb.serializable) rather than
+   via same-transaction co-reads."
   (:require [jepsen.client :as client]
             [jepsen.generator :as gen]
             [jepsen.tests.cycle.append :as append]
@@ -87,7 +97,8 @@
 
 (defn simplify-topic-mops
   "Given a transaction's micro-ops, returns a simplified vector safe to run
-   against topics that aren't snapshot-isolated within a transaction. Two
+   against topics that aren't snapshot-isolated within a transaction, and
+   whose reads aren't pinned to the transaction's commit point either. Two
    rules, applied in order:
 
    1. Drops a topic-key read if that same key was already appended to
@@ -99,24 +110,35 @@
       precedes the write to the same key is unaffected -- it isn't
       expected to see a write that, in program order, hasn't happened yet.
 
-   2. After (1), if any topic-key read remains, keeps only the FIRST one
-      and drops every OTHER read in the transaction -- table reads
-      included. execute-topic-read! isn't attached to the transaction (a
-      topic replay read can't be snapshot-pinned regardless -- see its
-      docstring), so it reflects an independent point in real time. Two or
-      more reads in one transaction, where at least one is a topic read,
-      can therefore observe two different, mutually inconsistent moments
-      -- e.g. a transaction reading topic key A and table key B could see
-      A already reflecting some other transaction T's atomic write to both
-      A and B, while B still reflects pre-T state (or vice versa), a torn
-      view no valid serialization order could produce. Elle would
-      correctly flag this as impossible, but the actual cause would be our
-      own non-snapshot topic reads, not a real YDB bug. Restricting to at
-      most one read per transaction whenever a topic key is involved
-      removes anything for a second, differently-timed read to tear
-      against. Writes are unrestricted throughout -- they only take
-      effect atomically at commit, so they never observe a torn view the
-      way a second read could.
+   2. After (1), if any topic-key read remains, the ENTIRE transaction
+      collapses to just that one read (the first survivor) -- every other
+      mop is dropped, reads AND writes alike. execute-topic-read! is never
+      attached to the transaction (a topic replay read can't be
+      snapshot-pinned regardless -- see its docstring), so it executes and
+      returns at whatever real time apply-mop! happens to reach it, which
+      is always strictly BEFORE the transaction's actual commit (commit
+      only happens once every mop, including this read, has already run).
+      Mop order inside the transaction doesn't change this -- the read is
+      always earlier in real time than the commit. So even though a write
+      in the same transaction only takes effect atomically AT commit, that
+      commit point is a different, later moment than the read's. If some
+      other transaction T atomically commits writes to both the key our
+      read touched (A) and some key our transaction also writes (B)
+      somewhere in that gap, our transaction legitimately doesn't see T's
+      effect on A (the read ran before T committed) while its own write to
+      B lands, in commit order, after T's write to B -- from the outside,
+      that looks like \"before T\" via A and \"after T\" via B at once, a
+      cycle no real atomic transaction could produce. Elle would correctly
+      flag that as impossible, but the actual cause would be our own
+      non-instantaneous mixed operation, not a real YDB bug. Collapsing to
+      a lone read removes anything else in the transaction whose effective
+      timing could disagree with when the read actually ran. Transactions
+      with no topic-key read at all are returned unchanged and stay fully
+      unrestricted (any number of table/topic writes, any number of table
+      reads) -- all their effects, reads included, are then either
+      properly snapshot-consistent (table reads, under YDB's own
+      SERIALIZABLE_RW guarantee) or only take hold atomically at commit
+      (writes), so there's nothing for this problem to apply to.
 
    Applied at the GENERATOR level (see workload, via gen/map), not
    client-side in invoke! -- Elle's checker (elle.txn/intermediate-write-
@@ -142,18 +164,12 @@
 
                                :else mop))
                            mops))
-        first-topic-read-index (->> rule-1
-                                     (map-indexed vector)
-                                     (some (fn [[i [f k _]]]
-                                             (when (and (= f :r) (topic-key? test k)) i))))]
-    (if (nil? first-topic-read-index)
+        first-topic-read (->> rule-1
+                               (filter (fn [[f k _]] (and (= f :r) (topic-key? test k))))
+                               first)]
+    (if (nil? first-topic-read)
       rule-1
-      (vec (keep-indexed (fn [i [f _ _ :as mop]]
-                            (cond
-                              (= i first-topic-read-index) mop
-                              (= f :append) mop
-                              :else nil))
-                          rule-1)))))
+      [first-topic-read])))
 
 (defn apply-mop!
   [test tx topic-client writers [f k v :as mop]]

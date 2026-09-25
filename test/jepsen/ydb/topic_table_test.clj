@@ -30,28 +30,27 @@
   (testing "Rule 1: a topic-key read preceded by an append to that same key is dropped"
     (is (= [[:append 0 1]]
            (topic-table/simplify-topic-mops test-map [[:append 0 1] [:r 0 nil]])))
-    (testing "later appends to the same key still survive"
+    (testing "later appends to the same key still survive, if no topic read remains at all"
       (is (= [[:append 0 1] [:append 0 2]]
              (topic-table/simplify-topic-mops test-map [[:append 0 1] [:r 0 nil] [:append 0 2]])))))
 
-  (testing "Rule 1 does not affect a read that precedes the write to the same key"
-    (is (= [[:r 0 nil] [:append 0 1]]
-           (topic-table/simplify-topic-mops test-map [[:r 0 nil] [:append 0 1]]))))
-
-  (testing "Rule 2: only the first surviving topic-key read is kept, all other reads are dropped"
-    (testing "two different topic keys, both read"
+  (testing "Rule 2: a transaction with a surviving topic-key read collapses to that lone read"
+    (testing "a read that precedes the write to the same key survives rule 1, so rule 2 fires and drops the write"
+      (is (= [[:r 0 nil]]
+             (topic-table/simplify-topic-mops test-map [[:r 0 nil] [:append 0 1]]))))
+    (testing "two different topic keys, both read -- only the first survives, nothing else"
       (is (= [[:r 0 nil]]
              (topic-table/simplify-topic-mops test-map [[:r 0 nil] [:r 1 nil]]))))
-    (testing "a topic read and a table read -- the table read is dropped even though topic-specific"
+    (testing "a topic read and a table read -- the table read is dropped regardless of order"
       (is (= [[:r 0 nil]]
              (topic-table/simplify-topic-mops test-map [[:r 2 nil] [:r 0 nil]])))
       (is (= [[:r 0 nil]]
              (topic-table/simplify-topic-mops test-map [[:r 0 nil] [:r 2 nil]]))))
-    (testing "writes around the kept read all survive"
-      (is (= [[:append 2 1] [:r 0 nil] [:append 1 9]]
+    (testing "writes around a surviving topic read are dropped too, not just other reads"
+      (is (= [[:r 0 nil]]
              (topic-table/simplify-topic-mops test-map [[:append 2 1] [:r 0 nil] [:append 1 9]])))))
 
-  (testing "Combined: rule 1 drops the RYOW read, rule 2 then keeps the one remaining topic read"
-    (is (= [[:append 0 5] [:append 0 6] [:r 1 nil]]
+  (testing "Combined: rule 1 drops the RYOW read, then rule 2 collapses to the one remaining topic read"
+    (is (= [[:r 1 nil]]
            (topic-table/simplify-topic-mops
              test-map [[:append 0 5] [:r 0 nil] [:append 0 6] [:r 1 nil]])))))
