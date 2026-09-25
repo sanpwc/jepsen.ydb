@@ -201,6 +201,22 @@
       .getStatus
       .expectSuccess))
 
+(defn timeout!
+  "Throws an ex-info marking an operation whose outcome is genuinely
+   undetermined because we gave up waiting for a definite server response
+   (e.g. a topic WriteAck or replay-read timeout) -- the operational analog
+   of YDB's own UNDETERMINED status code: even after a subsequent rollback!
+   succeeds client-side, we still don't know whether the server had already
+   registered the timed-out call before we stopped waiting for it.
+
+   with-errors recognizes this specific marker and classifies it :info,
+   without catching exceptions generally -- callers must use this (not a
+   bare ex-info/throw) for with-errors to see it; any other exception still
+   propagates uncaught, so real bugs keep surfacing via the
+   unhandled-exceptions checker instead of being silently absorbed."
+  [msg data]
+  (throw (ex-info msg (assoc data :type ::timeout))))
+
 (defmacro with-errors
   "Takes an op and a code block, will assoc :type :fail or :type :info on known exceptions."
   [op & body]
@@ -224,10 +240,15 @@
            (= status-code# StatusCode/UNDETERMINED) (assoc ~op :type :info, :error [:undetermined (.toString status#)])
            ; For other exceptions we assume we don't know whether it committed or not
            :else (assoc ~op :type :info, :error [:unexpected-result (.toString status#)]))))
-     ; Anything else -- e.g. a topic WriteAck/replay-read timeout under a
-     ; nemesis-induced partition or pause -- also leaves the outcome
-     ; genuinely undetermined rather than being a known, reasoned-about
-     ; failure, so treat it the same way instead of letting it escape as an
-     ; unhandled exception.
-     (catch Exception e#
-       (assoc ~op :type :info, :error [:unexpected-exception (.toString e#)]))))
+     ; A specific, deliberately-thrown marker (see timeout!) for an
+     ; operation that genuinely timed out waiting for a server response --
+     ; NOT a blanket catch-all. Anything else (a real bug, InterruptedException
+     ; from Jepsen's own shutdown/interruption machinery, etc.) is NOT caught
+     ; here and propagates as before: InterruptedException must reach its
+     ; normal handler to keep Jepsen's interruption protocol intact, and a
+     ; genuine driver bug should surface via the unhandled-exceptions checker
+     ; rather than being silently reclassified as :info.
+     (catch clojure.lang.ExceptionInfo e#
+       (if (= ::timeout (:type (ex-data e#)))
+         (assoc ~op :type :info, :error [:timeout (ex-message e#)])
+         (throw e#)))))

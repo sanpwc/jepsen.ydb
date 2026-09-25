@@ -11,7 +11,7 @@
             [clojure.tools.logging :refer [info]]
             [jepsen.ydb.conn :as conn])
   (:import (java.nio.charset StandardCharsets)
-           (java.util.concurrent ExecutionException TimeUnit)
+           (java.util.concurrent ExecutionException TimeoutException TimeUnit)
            (tech.ydb.core StatusCode)
            (tech.ydb.core UnexpectedResultException)
            (tech.ydb.topic.settings DescribeTopicSettings
@@ -162,7 +162,9 @@
           (.get write-ack-timeout-ms TimeUnit/MILLISECONDS))
       (catch ExecutionException e
         (let [cause (.getCause e)]
-          (throw (if (instance? UnexpectedResultException cause) cause e)))))))
+          (throw (if (instance? UnexpectedResultException cause) cause e))))
+      (catch TimeoutException _
+        (conn/timeout! "topic WriteAck timed out" {:topic (:topic-name test) :key k})))))
 
 (defn execute-topic-read!
   "Reads the list for key k via a full non-destructive replay: describes the
@@ -171,8 +173,15 @@
    keeps only the ones tagged with key k (the partition may be shared with
    other keys). Deliberately not attached to any transaction -- a topic
    replay read isn't tied to a snapshot regardless, so there's no
-   correctness benefit to doing so. Returns nil if key k has never been
-   appended to, or a vector of longs otherwise."
+   correctness benefit to doing so. Always returns a (possibly empty)
+   vector of longs, never nil -- an empty vector is a confirmed observation
+   (\"this key currently holds nothing\"), not the unexecuted-read
+   placeholder Elle's generator uses (a bare nil in a :value, as in
+   [:r k nil]). Conflating the two would make a genuinely completed, empty
+   read indistinguishable from an operation that never ran, which matches
+   jepsen.ydb.append/parse-list-read-result's convention for the table
+   side (also always a vector, never nil) and avoids ambiguity when reading
+   raw history dumps by hand."
   [test topic-client k]
   (let [partition-id (partition-for-key test topic-client k)
         describe-settings (-> (DescribeTopicSettings/newBuilder)
@@ -187,7 +196,8 @@
         offsets (-> partition .getPartitionStats .getPartitionOffsets)
         start (.getStart offsets)
         end (.getEnd offsets)]
-    (when (> end start)
+    (if (<= end start)
+      []
       (let [reader-settings (-> (ReaderSettings/newBuilder)
                                  .withoutConsumer
                                  (.addTopic (-> (TopicReadSettings/newBuilder)
@@ -198,16 +208,14 @@
             reader (.createSyncReader topic-client reader-settings)]
         (try
           (.initAndWait reader)
-          (let [values (->> (range (- end start))
-                            (mapv (fn [_]
-                                    (let [msg (.receive reader read-timeout-ms TimeUnit/MILLISECONDS)]
-                                      (when (nil? msg)
-                                        (throw (ex-info "topic replay read timed out"
-                                                        {:topic (:topic-name test) :key k})))
-                                      (decode-message (.getData msg)))))
-                            (filter (fn [[mk _]] (= mk (long k))))
-                            (mapv second))]
-            (when (seq values)
-              values))
+          (->> (range (- end start))
+               (mapv (fn [_]
+                       (let [msg (.receive reader read-timeout-ms TimeUnit/MILLISECONDS)]
+                         (when (nil? msg)
+                           (conn/timeout! "topic replay read timed out"
+                                          {:topic (:topic-name test) :key k}))
+                         (decode-message (.getData msg)))))
+               (filter (fn [[mk _]] (= mk (long k))))
+               (mapv second))
           (finally
             (.shutdown reader)))))))

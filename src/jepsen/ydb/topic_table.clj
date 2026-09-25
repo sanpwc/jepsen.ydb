@@ -58,11 +58,27 @@
 (defn new-final-reads-gen
   "Builds a fresh generator (an arity-0 function; see jepsen.generator's
    Fn/AFunction handling of plain functions) that reads every topic key ever
-   touched, once, in batches. Evaluated lazily -- only invoked once the main
-   phase has finished and touched-topic-keys is fully populated, via
+   touched, once, one key per :txn. Evaluated lazily -- only invoked once the
+   main phase has finished and touched-topic-keys is fully populated, via
    ydb-test's existing (:final-generator workload) handling (already wired
    up for kafka-topic; --kafka-final-time-limit governs its time budget for
    any workload, including this one).
+
+   One key per :txn, not batched: this generator is wired directly as
+   :final-generator and, unlike the main generator, never passes through
+   gen/map/simplify-topic-mops (ydb-test's final-generator handling just
+   does (gen/clients workload-final-gen), no simplification step) -- so
+   nothing else enforces simplify-topic-mops's rule 2 here. Batching several
+   topic reads into one :txn would recreate exactly the torn-read problem
+   rule 2 exists to avoid: execute-topic-read! isn't snapshot-pinned, so the
+   reads in one batch each run at a different real moment, and if some other
+   transaction commits in the gap between the batch's first and last read,
+   Elle sees our one :ok completion as a single atomic transaction that
+   observed an impossible torn combination of before- and after-states.
+   Running this generator's ops through simplify-topic-mops instead of
+   splitting one-key-per-txn isn't an option either -- rule 2 would keep only
+   the first key of each batch and silently drop the rest, defeating the
+   point of a *complete* sweep.
 
    The returned function is one-shot (guarded by emitted?): jepsen's Fn
    generator wrapper calls an arity-0 generator function again once the
@@ -76,8 +92,7 @@
       (when (compare-and-set! emitted? false true)
         (->> @touched-topic-keys
              sort
-             (partition-all 8)
-             (map (fn [batch] {:type :invoke, :f :txn, :value (mapv (fn [k] [:r k nil]) batch)})))))))
+             (map (fn [k] {:type :invoke, :f :txn, :value [[:r k nil]]})))))))
 
 (defn total-key-count
   "The combined table+topic key space size, used both to configure the
