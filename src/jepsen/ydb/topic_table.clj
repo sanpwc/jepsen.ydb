@@ -204,7 +204,21 @@
     (let [transport (conn/open-transport test node)
           query-client (conn/open-query-client transport)
           topic-client (conn/open-topic-client transport)]
-      (assoc this :transport transport :query-client query-client :topic-client topic-client)))
+      ; writers must be a fresh, per-worker atom, NOT the prototype's --
+      ; each cached AsyncWriter is bound to the specific topic-client that
+      ; created it (via .createAsyncWriter), and every worker gets its own
+      ; topic-client above. Leaving writers shared (the prototype Client's
+      ; atom, copied by reference through assoc) let one worker's writer,
+      ; tied to its own connection, end up cached and reused by a different
+      ; worker -- if the owning worker's client later closed, the other
+      ; worker would hit "Writer is already stopped" trying to reuse it.
+      ; It also raced: concurrent workers sharing one atom could both miss
+      ; the cache for the same partition and overwrite each other's entry
+      ; in get-writer!'s check-then-act. Since each worker's own atom is
+      ; only ever touched by that worker's single dedicated thread, this
+      ; also removes the race, not just the cross-worker reuse.
+      (assoc this :transport transport :query-client query-client
+                  :topic-client topic-client :writers (atom {}))))
 
   (setup! [this test]
     (once-per-cluster
